@@ -1,0 +1,5 @@
+/dist/build
+server.db
+server.db-wal
+server.db-shm
+dist/src/server.exe
