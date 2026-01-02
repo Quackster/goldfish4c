@@ -976,39 +976,50 @@ void cleanup_user(int client_id) {
 /* -------------------- packet processing -------------------- */
 
 static int cb_pubs_row(StmtRow *row, void *ud) {
-    // original used row[1], row[2], row[3], row[4], row[5]
-    // format: "%s,%s,%s/...,%s\t%s,%s,%s,%s\r"
+    // We now SELECT: name, now_in, max_in, mapname, heightmap
+    // Indexes: 0 name, 1 now_in, 2 max_in, 3 mapname, 4 heightmap
     char *out = (char*)ud;
     if (!out) return 1;
 
-    if (row->cols >= 6) {
-        char temp[512];
-        // indices: 1..5
+    if (row->cols >= 5) {
+        char temp[768];
         snprintf(temp, sizeof(temp),
-                 "%s,%s,%s/127.0.0.1/127.0.0.1,37120,%s\t%s,%s,%s,%s\r",
-                 row->bufs[1], row->bufs[2], row->bufs[3], row->bufs[1],
-                 row->bufs[4], row->bufs[2], row->bufs[3], row->bufs[5]);
-        // concat with bounds
+            "%s,%s,%s,127.0.0.1/127.0.0.1,37120,%s\t%s,%s,%s,%s\r",
+            row->bufs[0],  // name
+            row->bufs[1],  // now_in
+            row->bufs[2],  // max_in
+            row->bufs[0],  // name again (after port)
+            row->bufs[3],  // mapname
+            row->bufs[1],  // now_in again
+            row->bufs[2],  // max_in again
+            row->bufs[4]   // heightmap
+        );
+
         strncat(out, temp, 4096 - strlen(out) - 1);
     }
     return 0;
 }
 
 static int cb_rooms_busy_row(StmtRow *row, void *ud) {
-    // original used rooms row[0], row[1], row[3], row[4], row[5], row[6], row[10], row[12]
+    // We now SELECT: id, name, owner, door, pass, floor, inroom, `desc`
+    // Indexes: 0 id, 1 name, 2 owner, 3 door, 4 pass, 5 floor, 6 inroom, 7 desc
     char *out = (char*)ud;
-	
-	printf("test 1\n");
-	
     if (!out) return 1;
-	printf("test 2 %d\n", row->cols);
-	
-    if (row->cols >= 13) {
-        char temp[512];
+
+    if (row->cols >= 8) {
+        char temp[1024];
         snprintf(temp, sizeof(temp),
-                 "\r%s/%s/%s/%s/%s/%s/127.0.0.1/127.0.0.1/37120/%s/null/%s",
-                 row->bufs[0], row->bufs[1], row->bufs[3], row->bufs[4], row->bufs[5], row->bufs[6],
-                 row->bufs[10], row->bufs[12]);
+            "\r%s/%s/%s/%s/%s/%s/127.0.0.1/127.0.0.1/37120/%s/null/%s",
+            row->bufs[0], // id
+            row->bufs[1], // name
+            row->bufs[2], // owner
+            row->bufs[3], // door
+            row->bufs[4], // pass
+            row->bufs[5], // floor
+            row->bufs[6], // inroom
+            row->bufs[7]  // desc
+        );
+
         strncat(out, temp, 4096 - strlen(out) - 1);
     }
     return 0;
@@ -1187,7 +1198,7 @@ void process_packet(int client_id, char* packet) {
     }
     else if (strcmp(token, "INITUNITLISTENER") == 0) {
         char room_data[4096] = "";
-        stmt_query_each_row(conn, "SELECT * FROM pubs", NULL, 0, cb_pubs_row, room_data);
+        stmt_query_each_row(conn, "SELECT name, now_in, max_in, mapname, heightmap FROM pubs", NULL, 0, cb_pubs_row, room_data);
 
         char all_units[4096];
         snprintf(all_units, sizeof(all_units), "ALLUNITS\r%s", room_data);
@@ -1195,7 +1206,10 @@ void process_packet(int client_id, char* packet) {
     }
     else if (strcmp(token, "SEARCHBUSYFLATS") == 0) {
         char room_data[4096] = "";
-        stmt_query_each_row(conn, "SELECT * FROM rooms ORDER BY inroom DESC", NULL, 0, cb_rooms_busy_row, room_data);
+		stmt_query_each_row(conn,
+			"SELECT id, name, owner, door, pass, floor, inroom, `desc` "
+			"FROM rooms ORDER BY inroom DESC",
+			NULL, 0, cb_rooms_busy_row, room_data);
 
         char busy_flats[4096];
         snprintf(busy_flats, sizeof(busy_flats), "BUSY_FLAT_RESULTS 1%s", room_data);
@@ -1468,11 +1482,11 @@ void process_packet(int client_id, char* packet) {
             int got = stmt_query_first_row(conn, sql_room, p, 1, &room, 2048);
             if (got == 1) {
                 // original uses room[12], room[8], room[9], room[3], room[7]
-                const char *model = (room.cols > 7 ? room.bufs[7] : "");
+                const char *model = (room.cols > 7 ? room.bufs[6] : "");
                 const char *owner = (room.cols > 3 ? room.bufs[3] : "");
                 const char *wall = (room.cols > 8 ? room.bufs[8] : "");
                 const char *floor = (room.cols > 9 ? room.bufs[9] : "");
-                const char *desc = (room.cols > 12 ? room.bufs[12] : "");
+                const char *desc = (room.cols > 12 ? room.bufs[2] : "");
 
                 char room_ready[1096];
                 snprintf(room_ready, sizeof(room_ready), "ROOM_READY\r%s", desc);
