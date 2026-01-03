@@ -27,11 +27,11 @@
 */
 #define LOG_ERR     1   /* errors/warnings */
 #define LOG_NET     1   /* sockets/connect/disconnect */
-#define LOG_PROTO   0   /* raw protocol send/recv */
-#define LOG_PKT     0   /* parsed packet routing/commands */
+#define LOG_PROTO   1   /* raw protocol send/recv */
+#define LOG_PKT     1   /* parsed packet routing/commands */
 #define LOG_DB      0   /* SQL/stmt lifecycle + DB ops */
-#define LOG_THREAD  0   /* threading/pathfinding */
-#define LOG_STATE   0   /* user/room state changes */
+#define LOG_THREAD  1   /* threading/pathfinding */
+#define LOG_STATE   1   /* user/room state changes */
 
 /* Optional: master switch (uncomment to force-enable most logging)
 #define LOG_ALL 0
@@ -1301,10 +1301,10 @@ static void process_packet(int client_id, char* packet) {
                         "e1026 flower2 10 26 1 2");
 
                     snprintf(users[client_id].roomcache, sizeof(users[client_id].roomcache),
-                             "xxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx");
+                             "XXXXXXXXX77777777777XXXXX\rXXXXXXXXX777777777777XXXX\rXXXXXXXXX777777777766XXXX\rXXXXXXXXX777777777755XXXX\rXX333333333333333334433XX\rXX333333333333333333333XX\rXX333333333333333333333XX\r33333333333333333333333XX\r333333XXXXXXX3333333333XX\r333333XXXXXXX2222222222XX\r333333XXXXXXX2222222222XX\rXX3333XXXXXXX2222222222XX\rXX3333XXXXXXX222222221111\rXX3333XXXXXXX111111111111\r333333XXXXXXX111111111111\r3333333222211111111111111\r3333333222211111111111111\r3333333222211111111111111\rXX33333222211111111111111\rXX33333222211111111111111\rXX3333322221111111XXXXXXX\rXXXXXXX22221111111XXXXXXX\rXXXXXXX22221111111XXXXXXX\rXXXXXXX22221111111XXXXXXX\rXXXXXXX22221111111XXXXXXX\rXXXXXXX222X1111111XXXXXXX\rXXXXXXX222X1111111XXXXXXX\rXXXXXXXXXXXX11XXXXXXXXXXX\rXXXXXXXXXXXX11XXXXXXXXXXX\rXXXXXXXXXXXX11XXXXXXXXXXX\rXXXXXXXXXXXX11XXXXXXXXXXX");
 
                     send_data(client_id,
-                        "HEIGHTMAP\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx");
+                        "HEIGHTMAP\rXXXXXXXXX77777777777XXXXX\rXXXXXXXXX777777777777XXXX\rXXXXXXXXX777777777766XXXX\rXXXXXXXXX777777777755XXXX\rXX333333333333333334433XX\rXX333333333333333333333XX\rXX333333333333333333333XX\r33333333333333333333333XX\r333333XXXXXXX3333333333XX\r333333XXXXXXX2222222222XX\r333333XXXXXXX2222222222XX\rXX3333XXXXXXX2222222222XX\rXX3333XXXXXXX222222221111\rXX3333XXXXXXX111111111111\r333333XXXXXXX111111111111\r3333333222211111111111111\r3333333222211111111111111\r3333333222211111111111111\rXX33333222211111111111111\rXX33333222211111111111111\rXX3333322221111111XXXXXXX\rXXXXXXX22221111111XXXXXXX\rXXXXXXX22221111111XXXXXXX\rXXXXXXX22221111111XXXXXXX\rXXXXXXX22221111111XXXXXXX\rXXXXXXX222X1111111XXXXXXX\rXXXXXXX222X1111111XXXXXXX\rXXXXXXXXXXXX11XXXXXXXXXXX\rXXXXXXXXXXXX11XXXXXXXXXXX\rXXXXXXXXXXXX11XXXXXXXXXXX\rXXXXXXXXXXXX11XXXXXXXXXXX");
 
                     char user_packet[1024];
                     const char *fig = users[client_id].figure;
@@ -1317,6 +1317,7 @@ static void process_packet(int client_id, char* packet) {
 
                     users[client_id].userx = 12;
                     users[client_id].usery = 27;
+					users[client_id].userz = 1;
 
                     char status_packet[1024];
                     snprintf(status_packet, sizeof(status_packet), "STATUS \r%s 12,27,1,0,0/mod 0/", users[client_id].name);
@@ -1858,7 +1859,9 @@ static void process_packet(int client_id, char* packet) {
                 pthread_cancel(users[client_id].pathfinding_thread);
             }
 
-            pthread_create(&users[client_id].pathfinding_thread, NULL, pathfinding_thread, &users[client_id].id);
+			pthread_create(&users[client_id].pathfinding_thread, NULL,
+						   pathfinding_thread, (void*)(intptr_t)client_id);
+			   
             pthread_mutex_unlock(&users_mutex);
         }
     }
@@ -2515,8 +2518,47 @@ static char* filter_chat_message(char* message) { return message; }
 
 /* -------------------- pathfinding -------------------- */
 
+/* -------------------- mv status helpers -------------------- */
+
+/* Direction -> rx/ry mapping (matches your C# example)
+   dx,dy:
+     -1,-1 => 7,7
+     -1,+1 => 5,5
+     +1,-1 => 1,1
+     +1,+1 => 3,3
+     -1, 0 => 6,6
+     +1, 0 => 2,2
+      0,-1 => 0,0
+      0,+1 => 4,4
+*/
+static void calc_rxry_from_step(int dx, int dy, int *rx, int *ry) {
+    int r = 2;
+    if (dx < 0 && dy < 0) r = 7;
+    else if (dx < 0 && dy > 0) r = 5;
+    else if (dx > 0 && dy < 0) r = 1;
+    else if (dx > 0 && dy > 0) r = 3;
+    else if (dx < 0)         r = 6;
+    else if (dx > 0)         r = 2;
+    else if (dy < 0)         r = 0;
+    else if (dy > 0)         r = 4;
+    *rx = r;
+    *ry = r;
+}
+
+/* Build OwnData exactly like elsewhere */
+static void build_own_data(int client_id, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    out[0] = '\0';
+    pthread_mutex_lock(&users_mutex);
+    if (users[client_id].owner || users[client_id].rights) {
+        snprintf(out, outsz, "flatctrl useradmin/");
+    }
+    pthread_mutex_unlock(&users_mutex);
+}
+
+
 static void* pathfinding_thread(void* arg) {
-    int client_id = *(int*)arg;
+    int client_id = (int)(intptr_t)arg;
 
     pthread_mutex_lock(&users_mutex);
     int target_x = users[client_id].target_x;
@@ -2532,8 +2574,11 @@ static void* pathfinding_thread(void* arg) {
             break;
         }
 
+        int room_id   = users[client_id].inroom;
         int current_x = users[client_id].userx;
         int current_y = users[client_id].usery;
+        int current_z = users[client_id].userz;
+        int dancing   = users[client_id].dance;
         pthread_mutex_unlock(&users_mutex);
 
         if (current_x == target_x && current_y == target_y) {
@@ -2552,35 +2597,76 @@ static void* pathfinding_thread(void* arg) {
         if (current_y < target_y) new_y++;
         else if (current_y > target_y) new_y--;
 
-        int height = get_room_height(new_x, new_y, users[client_id].roomcache);
+        int next_z = get_room_height(new_x, new_y, users[client_id].roomcache);
+        int now_z  = current_z;
 
-        LTHR("pathfinding step client=%d pos=(%d,%d) height=%d", client_id, new_x, new_y, height);
+        int rx = 2, ry = 2;
+        calc_rxry_from_step(new_x - current_x, new_y - current_y, &rx, &ry);
+
+        char own_data[64];
+        build_own_data(client_id, own_data, sizeof(own_data));
 
         char status_packet[1024];
-        char own_data[64] = "";
-        pthread_mutex_lock(&users_mutex);
-        if (users[client_id].owner || users[client_id].rights) strcpy(own_data, "flatctrl useradmin/");
-        pthread_mutex_unlock(&users_mutex);
+        if (dancing) {
+            snprintf(status_packet, sizeof(status_packet),
+                     "STATUS \r%s %d,%d,%d,%d,%d/mv %d,%d,%d/%sdance/",
+                     users[client_id].name,
+                     current_x, current_y, now_z, rx, ry,
+                     new_x, new_y, next_z,
+                     own_data);
+        } else {
+            snprintf(status_packet, sizeof(status_packet),
+                     "STATUS \r%s %d,%d,%d,%d,%d/mv %d,%d,%d/%s",
+                     users[client_id].name,
+                     current_x, current_y, now_z, rx, ry,
+                     new_x, new_y, next_z,
+                     own_data);
+        }
+        send_data_room(room_id, status_packet);
 
-        snprintf(status_packet, sizeof(status_packet), "STATUS \r%s %d,%d,%d,2,2/%s",
-                 users[client_id].name, new_x, new_y, height, own_data);
-        send_data_room(users[client_id].inroom, status_packet);
-
         pthread_mutex_lock(&users_mutex);
-        users[client_id].userx = new_x;
-        users[client_id].usery = new_y;
-        users[client_id].userz = height;
+        users[client_id].userx  = new_x;
+        users[client_id].usery  = new_y;
+        users[client_id].userz  = next_z;
+        users[client_id].userrx = rx;
+        users[client_id].userry = ry;
         pthread_mutex_unlock(&users_mutex);
 
         usleep(500000);
     }
 
+	pthread_mutex_lock(&users_mutex);
+	int room_id = users[client_id].inroom;
+	int x = users[client_id].userx;
+	int y = users[client_id].usery;
+	int z = users[client_id].userz;
+	int rx = users[client_id].userrx;
+	int ry = users[client_id].userry;
+	int dancing = users[client_id].dance;
+	pthread_mutex_unlock(&users_mutex);
+
+	char own_data[64];
+	build_own_data(client_id, own_data, sizeof(own_data));
+
+	char final_status[512];
+	if (dancing) {
+		snprintf(final_status, sizeof(final_status),
+				 "STATUS \r%s %d,%d,%d,%d,%d/%sdance/",
+				 users[client_id].name, x, y, z, rx, ry, own_data);
+	} else {
+		snprintf(final_status, sizeof(final_status),
+				 "STATUS \r%s %d,%d,%d,%d,%d/%s",
+				 users[client_id].name, x, y, z, rx, ry, own_data);
+	}
+	send_data_room(room_id, final_status);
+ 
     LTHR("pathfinding stop client=%d", client_id);
     return NULL;
 }
 
+
 static int get_room_height(int x, int y, char* heightmap) {
     (void)heightmap;
-    if (x >= 0 && x < 10 && y >= 0 && y < 28) return 1;
+    if (x >= 0 && x < 10 && y >= 0 && y < 28) return 0;
     return 0;
 }
