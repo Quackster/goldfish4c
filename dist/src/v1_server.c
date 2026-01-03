@@ -1,19 +1,19 @@
 /*
-    Fully converted to MySQL C API prepared statements (MYSQL_STMT)
-    for ALL database operations in the code you provided.
+    Server.c — MySQL C API (MYSQL_STMT) prepared statements for ALL DB operations.
 
-    Key changes:
-    - Removed ALL mysql_query()+sprintf() that included user data.
-    - Removed escape_string() usage (kept stub for compatibility but unused).
-    - Added a small prepared-statement layer:
-        * stmt_exec() for INSERT/UPDATE/DELETE
-        * stmt_query_each_row() for multi-row SELECT
-        * stmt_query_first_row() for single-row SELECT
-      using dynamic result binding (no need to know column names/types ahead of time).
-    - Fixed packet_copy overflow risk by bounded copy.
+    Fixes in this version (per your request):
+    - Integrated with the actual DB schema from v1.sql (no more SELECT * index mismatches).
+    - Fixed row index usage everywhere (rooms/roomitems/useritems/catalogue/etc).
+    - Fixed buffers to support DB field sizes + safer concatenation.
+    - Fixed STRIP paging (LIMIT offset,count; not offset,end).
+    - Removed broken SEARCHFLAT callback usage and simplified room list formatting.
+    - Rewrote FAVORITES using a JOIN (no N+1).
+    - PURCHASE now uses catalogue.price from DB (prevents client price spoofing).
+    - Room item packets now map to the v1.sql roomitems columns:
+        id, shortname, xx, yy, zz, rotate, extra, longname, color
 
-    Build note:
-    - Link against mysqlclient / libmysql.
+    Build:
+      gcc server.c -o server -lmysqlclient -lpthread
 */
 
 #ifdef _WIN32
@@ -89,51 +89,76 @@
 #include <mysql/mysql.h>
 
 #define MAX_CLIENTS 150
-#define BUFFER_SIZE 4096
 #define INVALID_SOCKET -1
+
+/* Protocol safety:
+   - the wire format uses a 4-digit length header => max 9999 bytes.
+   - keep responses under this.
+*/
+#define MAX_WIRE_PAYLOAD 9999
+
+/* IO buffers */
+#define INBUF_SIZE   8192
+#define BIGBUF_SIZE  16384
+#define MIDBUF_SIZE  8192
+
+/* DB bind output buffers */
+#define DB_OUTBUF_SMALL  64
+#define DB_OUTBUF_MED    512
+#define DB_OUTBUF_LARGE  4096
 
 typedef struct {
     int id;
     int socket;
+
     char name[50];
     char password[50];
     int credits;
+
     char email[255];
     char figure[255];
     char birthday[25];
     char phonenumber[20];
-    char customData[1096];
-    int had_read_agreement;
+    char customData[1096 + 16]; /* db: varchar(1096), plus a little headroom */
+    int  had_read_agreement;
     char sex[10];
     char country[50];
     char has_special_rights[10];
     char badge_type[20];
+
     int inroom;
+
     int owner;
     int rights;
     int teleport;
     int moonwalk;
     int dance;
+
     int userx;
     int usery;
     int userz;
+
     int userrx;
     int userry;
-    char roomcache[2048];
+
+    char roomcache[2048]; /* heightmap cache used by get_room_height */
     int handcache;
+
     int used;
     int server;
+
     pthread_t pathfinding_thread;
     int pathfinding_active;
     int target_x;
     int target_y;
+
     MYSQL* db_conn;
 } User;
 
-User users[MAX_CLIENTS];
-pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
-MYSQL* global_db_conn = NULL;
+static User users[MAX_CLIENTS];
+static pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
+static MYSQL* global_db_conn = NULL;
 
 /* -------------------- networking helpers -------------------- */
 
@@ -149,41 +174,35 @@ static int recv_all(int sock, void *buf, int len) {
 }
 
 static int parse_len4(const char hdr[4]) {
-    char tmp[5];
-    memcpy(tmp, hdr, 4);
-    tmp[4] = '\0';
-
     char digits[5];
     int j = 0;
     for (int i = 0; i < 4; i++) {
-        unsigned char c = (unsigned char)tmp[i];
+        unsigned char c = (unsigned char)hdr[i];
         if (c == ' ') continue;
         if (!isdigit(c)) return -1;
         if (j < 4) digits[j++] = (char)c;
     }
     digits[j] = '\0';
-
     if (j == 0) return 0;
     long v = strtol(digits, NULL, 10);
     if (v < 0 || v > 9999) return -1;
     return (int)v;
 }
 
-static void dump_hex(const char *tag, const void *buf, size_t len) {
-    const unsigned char *p = (const unsigned char*)buf;
-    printf("%s (%zu): ", tag, len);
-    for (size_t i = 0; i < len; i++) printf("%02X ", p[i]);
-    printf("\n");
-}
-
 /* -------------------- protocol send helper -------------------- */
+
 static int send_cmd(User *c, const char *data) {
     if (!c || c->socket == INVALID_SOCKET) return -1;
     if (!data) data = "";
 
     size_t dlen = strlen(data);
     size_t plen = 2 + dlen + 3; /* "# " + data + "\r##" */
-    if (plen > 9999) return -1;
+    if (plen > MAX_WIRE_PAYLOAD) {
+        /* truncate to fit wire limit */
+        size_t max_d = MAX_WIRE_PAYLOAD - 2 - 3;
+        dlen = max_d;
+        plen = 2 + dlen + 3;
+    }
 
     char *payload = (char*)malloc(plen + 1);
     if (!payload) return -1;
@@ -193,53 +212,36 @@ static int send_cmd(User *c, const char *data) {
     memcpy(payload + 2 + dlen, "\r##", 3);
     payload[plen] = '\0';
 
-	// dump_hex("TX body", data, dlen);
-	//printf("test: %s\n", data);
-    
-	int rc = send(c->socket, payload, (int)plen, 0);
-    
-    // Create a readable version for console output
-    char *readable = (char*)malloc(plen * 4 + 1); // Allow space for 4x expansion
-    if (readable) {
-        size_t read_pos = 0;
-        for (size_t i = 0; i < plen && read_pos < plen * 4; i++) {
-            if (payload[i] < 32 || payload[i] == 127) {
-                // Replace with ASCII number
-                int len = snprintf(readable + read_pos, plen * 4 - read_pos, "[%d]", (unsigned char)payload[i]);
-                if (len > 0 && len < (int)(plen * 4 - read_pos)) {
-                    read_pos += len;
+    int rc = send(c->socket, payload, (int)plen, 0);
+
+    /* optional readable debug output */
+    {
+        char *readable = (char*)malloc(plen * 4 + 1);
+        if (readable) {
+            size_t read_pos = 0;
+            for (size_t i = 0; i < plen && read_pos < plen * 4; i++) {
+                unsigned char ch = (unsigned char)payload[i];
+                if (ch < 32 || ch == 127) {
+                    int n = snprintf(readable + read_pos, (plen * 4) - read_pos, "[%u]", ch);
+                    if (n <= 0) break;
+                    read_pos += (size_t)n;
                 } else {
-                    break;
+                    readable[read_pos++] = (char)ch;
                 }
-            } else {
-                readable[read_pos++] = payload[i];
             }
+            readable[read_pos] = '\0';
+            printf("<-- %s\n", readable);
+            free(readable);
+        } else {
+            printf("<-- %s\n", payload);
         }
-        readable[read_pos] = '\0';
-        printf("<-- %s\n", readable);
-        free(readable);
-    } else {
-        printf("<-- %s\n", payload);
     }
 
     free(payload);
     return rc;
 }
 
-
-
 /* -------------------- prepared statement layer -------------------- */
-
-/*
-    We implement:
-    - stmt_exec(): execute INSERT/UPDATE/DELETE (optional params)
-    - stmt_query_each_row(): execute SELECT, dynamically binds result columns to strings,
-      then calls a callback for each row.
-    - stmt_query_first_row(): same but stops at first row and returns 1 if row exists, 0 if none.
-
-    Dynamic binding approach: bind every output column as MYSQL_TYPE_STRING with a fixed buffer.
-    MySQL will convert types to string if needed.
-*/
 
 typedef struct {
     MYSQL_BIND *bind;
@@ -265,10 +267,7 @@ static void stmtrow_free(StmtRow *r) {
 static int stmtrow_init_from_metadata(MYSQL_STMT *stmt, StmtRow *out, unsigned long buf_sz) {
     memset(out, 0, sizeof(*out));
     MYSQL_RES *meta = mysql_stmt_result_metadata(stmt);
-    if (!meta) {
-        // SELECT with no columns? treat as error
-        return -1;
-    }
+    if (!meta) return -1;
 
     unsigned int cols = mysql_num_fields(meta);
     mysql_free_result(meta);
@@ -280,7 +279,6 @@ static int stmtrow_init_from_metadata(MYSQL_STMT *stmt, StmtRow *out, unsigned l
     out->bufs = (char**)calloc(cols, sizeof(char*));
     out->lens = (unsigned long*)calloc(cols, sizeof(unsigned long));
     out->is_null = (my_bool*)calloc(cols, sizeof(my_bool));
-
     if (!out->bind || !out->bufs || !out->lens || !out->is_null) {
         stmtrow_free(out);
         return -1;
@@ -352,11 +350,12 @@ static int stmt_exec(MYSQL *conn, const char *sql, MYSQL_BIND *params, unsigned 
     return 0;
 }
 
-typedef int (*row_cb_fn)(StmtRow *row, void *ud); // return 0 to continue, nonzero to stop
+typedef int (*row_cb_fn)(StmtRow *row, void *ud); /* return 0 to continue, nonzero to stop */
 
 static int stmt_query_each_row(MYSQL *conn, const char *sql,
                                MYSQL_BIND *params, unsigned long param_count,
-                               row_cb_fn cb, void *ud)
+                               row_cb_fn cb, void *ud,
+                               unsigned long out_buf_sz)
 {
     MYSQL_STMT *stmt = mysql_stmt_init(conn);
     if (!stmt) return -1;
@@ -382,7 +381,7 @@ static int stmt_query_each_row(MYSQL *conn, const char *sql,
     }
 
     StmtRow row;
-    if (stmtrow_init_from_metadata(stmt, &row, 2048) != 0) {
+    if (stmtrow_init_from_metadata(stmt, &row, out_buf_sz) != 0) {
         mysql_stmt_close(stmt);
         return -1;
     }
@@ -403,7 +402,6 @@ static int stmt_query_each_row(MYSQL *conn, const char *sql,
             rc = -1;
             break;
         }
-
         if (cb) {
             int stop = cb(&row, ud);
             if (stop) break;
@@ -418,7 +416,7 @@ static int stmt_query_each_row(MYSQL *conn, const char *sql,
 
 static int stmt_query_first_row(MYSQL *conn, const char *sql,
                                 MYSQL_BIND *params, unsigned long param_count,
-                                StmtRow *out_row /* filled */, unsigned long out_buf_sz)
+                                StmtRow *out_row, unsigned long out_buf_sz)
 {
     MYSQL_STMT *stmt = mysql_stmt_init(conn);
     if (!stmt) return -1;
@@ -460,7 +458,7 @@ static int stmt_query_first_row(MYSQL *conn, const char *sql,
         mysql_stmt_free_result(stmt);
         stmtrow_free(out_row);
         mysql_stmt_close(stmt);
-        return 0; // no row
+        return 0;
     }
     if (f != 0 && f != MYSQL_DATA_TRUNCATED) {
         fprintf(stderr, "fetch failed: %s\n", mysql_stmt_error(stmt));
@@ -472,7 +470,7 @@ static int stmt_query_first_row(MYSQL *conn, const char *sql,
 
     mysql_stmt_free_result(stmt);
     mysql_stmt_close(stmt);
-    return 1; // got row
+    return 1;
 }
 
 /* -------------------- DB convenience funcs -------------------- */
@@ -485,16 +483,14 @@ static int db_check_login(MYSQL *conn, const char *username, const char *passwor
     bind_str_in(&p[1], password, &lp);
 
     StmtRow row;
-    int got = stmt_query_first_row(conn, sql, p, 2, &row, 32);
+    int got = stmt_query_first_row(conn, sql, p, 2, &row, DB_OUTBUF_SMALL);
     if (got == 1) stmtrow_free(&row);
-    return got; // 1 ok, 0 no, -1 error
+    return got;
 }
 
 static int db_load_user_data(MYSQL *conn, const char *username, const char *password, User *u) {
-    /*
-        We select the columns in the order your original mysql_fetch_row used:
-        row[1]..row[13] => name,password,credits,email,figure,birthday,phonenumber,customData,had_read_agreement,sex,country,has_special_rights,badge_type
-        Plus inroom (optional) is handled elsewhere in your code; we’ll also select it here to keep consistent.
+    /* users schema (v1.sql):
+       id,name,password,credits,email,figure,birthday,phonenumber,customData,had_read_agreement,sex,country,has_special_rights,badge_type,inroom
     */
     const char *sql =
         "SELECT id,name,password,credits,email,figure,birthday,phonenumber,customData,had_read_agreement,sex,country,has_special_rights,badge_type,inroom "
@@ -506,15 +502,10 @@ static int db_load_user_data(MYSQL *conn, const char *username, const char *pass
     bind_str_in(&p[1], password, &lp);
 
     StmtRow row;
-    int got = stmt_query_first_row(conn, sql, p, 2, &row, 2048);
+    int got = stmt_query_first_row(conn, sql, p, 2, &row, DB_OUTBUF_LARGE);
     if (got != 1) return got;
 
-    // Safety: verify expected column count
-    // Columns: 15 as in SELECT above.
-    // If schema differs, this still works best-effort using indices if present.
-    // Index mapping:
-    // 0 id, 1 name, 2 password, 3 credits, 4 email, 5 figure, 6 birthday, 7 phonenumber,
-    // 8 customData, 9 had_read_agreement, 10 sex, 11 country, 12 has_special_rights, 13 badge_type, 14 inroom
+    if (row.cols >= 1) u->id = atoi(row.bufs[0]);
     if (row.cols >= 2) snprintf(u->name, sizeof(u->name), "%s", row.bufs[1]);
     if (row.cols >= 3) snprintf(u->password, sizeof(u->password), "%s", row.bufs[2]);
     if (row.cols >= 4) u->credits = atoi(row.bufs[3]);
@@ -528,7 +519,7 @@ static int db_load_user_data(MYSQL *conn, const char *username, const char *pass
     if (row.cols >= 12) snprintf(u->country, sizeof(u->country), "%s", row.bufs[11]);
     if (row.cols >= 13) snprintf(u->has_special_rights, sizeof(u->has_special_rights), "%s", row.bufs[12]);
     if (row.cols >= 14) snprintf(u->badge_type, sizeof(u->badge_type), "%s", row.bufs[13]);
-    if (u->inroom == 0 && row.cols >= 15) u->inroom = atoi(row.bufs[14]);
+    if (row.cols >= 15) u->inroom = atoi(row.bufs[14]);
 
     stmtrow_free(&row);
     return 1;
@@ -552,7 +543,8 @@ static int db_update_user_inroom(MYSQL *conn, const char *name, int room_id) {
 }
 
 static int db_insert_chatlog(MYSQL *conn, const char *user, const char *msg, int room, const char *kind) {
-    const char *sql = "INSERT INTO chatloggs VALUES (NULL, ?, ?, ?, ?)";
+    /* chatloggs schema: id,user,msg,room,type */
+    const char *sql = "INSERT INTO chatloggs (user,msg,room,type) VALUES (?,?,?,?)";
     MYSQL_BIND p[4];
     unsigned long lu=0,lm=0,lk=0;
     bind_str_in(&p[0], user, &lu);
@@ -569,8 +561,8 @@ static int db_register_user(MYSQL *conn,
 {
     const char *sql =
         "INSERT INTO users "
-        "(name,password,credits,email,figure,birthday,phonenumber,customData,had_read_agreement,sex,country,has_special_rights,badge_type) "
-        "VALUES (?,?,?,?,1337,?,?,?,?,?,?,?,'0','0')";
+        "(name,password,credits,email,figure,birthday,phonenumber,customData,had_read_agreement,sex,country,has_special_rights,badge_type,inroom) "
+        "VALUES (?,?,?,?,1337,?,?,?,?,?,?,?,'0','0',0)";
 
     MYSQL_BIND p[10];
     unsigned long l0=0,l1=0,l2=0,l3=0,l4=0,l5=0,l6=0,l7=0,l8=0,l9=0;
@@ -624,25 +616,8 @@ static int db_delete_room_by_id(MYSQL *conn, const char *room_id_str) {
     return stmt_exec(conn, sql, p, 1);
 }
 
-static int db_add_favroom(MYSQL *conn, const char *user, const char *room_id_str) {
-    const char *sql = "INSERT INTO favrooms VALUES (NULL, ?, ?)";
-    MYSQL_BIND p[2];
-    unsigned long lu=0, lr=0;
-    bind_str_in(&p[0], user, &lu);
-    bind_str_in(&p[1], room_id_str, &lr);
-    return stmt_exec(conn, sql, p, 2);
-}
-
-static int db_del_favroom(MYSQL *conn, const char *room_id_str) {
-    const char *sql = "DELETE FROM favrooms WHERE roomid = ? LIMIT 1";
-    MYSQL_BIND p[1];
-    unsigned long lr=0;
-    bind_str_in(&p[0], room_id_str, &lr);
-    return stmt_exec(conn, sql, p, 1);
-}
-
 static int db_buddy_request(MYSQL *conn, const char *from_user, const char *to_user) {
-    const char *sql = "INSERT INTO buddy VALUES (NULL, ?, ?, '0')";
+    const char *sql = "INSERT INTO buddy (`from`,`to`,`accept`) VALUES (?,?,'0')";
     MYSQL_BIND p[2];
     unsigned long lf=0, lt=0;
     bind_str_in(&p[0], from_user, &lf);
@@ -651,7 +626,7 @@ static int db_buddy_request(MYSQL *conn, const char *from_user, const char *to_u
 }
 
 static int db_buddy_accept(MYSQL *conn, const char *from_user, const char *to_user) {
-    const char *sql = "UPDATE buddy SET accept='1' WHERE `from` LIKE ? AND `to`=? AND `accept`='0'";
+    const char *sql = "UPDATE buddy SET accept='1' WHERE `from`=? AND `to`=? AND `accept`='0'";
     MYSQL_BIND p[2];
     unsigned long lf=0, lt=0;
     bind_str_in(&p[0], from_user, &lf);
@@ -660,7 +635,7 @@ static int db_buddy_accept(MYSQL *conn, const char *from_user, const char *to_us
 }
 
 static int db_buddy_decline(MYSQL *conn, const char *from_user, const char *to_user) {
-    const char *sql = "DELETE FROM buddy WHERE `from` LIKE ? AND `to`=? AND `accept`='0'";
+    const char *sql = "DELETE FROM buddy WHERE `from`=? AND `to`=? AND `accept`='0'";
     MYSQL_BIND p[2];
     unsigned long lf=0, lt=0;
     bind_str_in(&p[0], from_user, &lf);
@@ -669,20 +644,23 @@ static int db_buddy_decline(MYSQL *conn, const char *from_user, const char *to_u
 }
 
 static int db_buddy_remove_pair(MYSQL *conn, const char *a, const char *b) {
-    // delete both directions where accept=1
-    const char *sql1 = "DELETE FROM buddy WHERE `from` LIKE ? AND `to`=? AND `accept`='1' LIMIT 1";
-    const char *sql2 = "DELETE FROM buddy WHERE `to` LIKE ? AND `from`=? AND `accept`='1' LIMIT 1";
+    const char *sql1 = "DELETE FROM buddy WHERE `from`=? AND `to`=? AND `accept`='1' LIMIT 1";
+    const char *sql2 = "DELETE FROM buddy WHERE `from`=? AND `to`=? AND `accept`='1' LIMIT 1";
     MYSQL_BIND p[2];
     unsigned long la=0, lb=0;
+
     bind_str_in(&p[0], a, &la);
     bind_str_in(&p[1], b, &lb);
-    stmt_exec(conn, sql1, p, 2);
-    stmt_exec(conn, sql2, p, 2);
+    (void)stmt_exec(conn, sql1, p, 2);
+
+    bind_str_in(&p[0], b, &lb);
+    bind_str_in(&p[1], a, &la);
+    (void)stmt_exec(conn, sql2, p, 2);
     return 0;
 }
 
 static int db_rights_insert(MYSQL *conn, int room_id, const char *user) {
-    const char *sql = "INSERT INTO rights VALUES (NULL, ?, ?)";
+    const char *sql = "INSERT INTO rights (room,user) VALUES (?,?)";
     MYSQL_BIND p[2];
     unsigned long lu=0;
     bind_int_in(&p[0], &room_id);
@@ -691,7 +669,7 @@ static int db_rights_insert(MYSQL *conn, int room_id, const char *user) {
 }
 
 static int db_rights_delete(MYSQL *conn, int room_id, const char *user) {
-    const char *sql = "DELETE FROM rights WHERE room=? AND user=?";
+    const char *sql = "DELETE FROM rights WHERE room=? AND user=? LIMIT 1";
     MYSQL_BIND p[2];
     unsigned long lu=0;
     bind_int_in(&p[0], &room_id);
@@ -699,44 +677,46 @@ static int db_rights_delete(MYSQL *conn, int room_id, const char *user) {
     return stmt_exec(conn, sql, p, 2);
 }
 
-static int db_has_rights(MYSQL *conn, const char *user) {
-    const char *sql = "SELECT 1 FROM rights WHERE user=? LIMIT 1";
-    MYSQL_BIND p[1];
+static int db_has_rights(MYSQL *conn, int room_id, const char *user) {
+    const char *sql = "SELECT 1 FROM rights WHERE room=? AND user=? LIMIT 1";
+    MYSQL_BIND p[2];
     unsigned long lu=0;
-    bind_str_in(&p[0], user, &lu);
+    bind_int_in(&p[0], &room_id);
+    bind_str_in(&p[1], user, &lu);
 
     StmtRow row;
-    int got = stmt_query_first_row(conn, sql, p, 1, &row, 32);
+    int got = stmt_query_first_row(conn, sql, p, 2, &row, DB_OUTBUF_SMALL);
     if (got == 1) stmtrow_free(&row);
     return got;
 }
 
 /* -------------------- Server prototypes -------------------- */
 
-void* handle_client(void* arg);
-void process_packet(int client_id, char* packet);
-void send_data(int client_id, const char* data);
-void send_data_all(const char* data);
-void send_data_room(int room_id, const char* data);
-void load_user_data(int client_id, const char* username, const char* password);
-void load_wordfilters();
-char* filter_chat_message(char* message);
-void* pathfinding_thread(void* arg);
-int get_room_height(int x, int y, char* heightmap);
-void init_database();
-void cleanup_user(int client_id);
+static void* handle_client(void* arg);
+static void process_packet(int client_id, char* packet);
+static void send_data(int client_id, const char* data);
+static void send_data_all(const char* data);
+static void send_data_room(int room_id, const char* data);
+static void load_user_data(int client_id, const char* username, const char* password);
+static void init_database(void);
+static void cleanup_user(int client_id);
+
+static void load_wordfilters(void);
+static char* filter_chat_message(char* message);
+
+static void* pathfinding_thread(void* arg);
+static int get_room_height(int x, int y, char* heightmap);
 
 /* kept for compatibility but UNUSED now */
-char* escape_string(MYSQL* conn, const char* str) {
-    (void)conn;
-    (void)str;
+static char* escape_string(MYSQL* conn, const char* str) {
+    (void)conn; (void)str;
     static char dummy[1] = {0};
     return dummy;
 }
 
 /* -------------------- main -------------------- */
 
-int main() {
+int main(void) {
 #ifdef _WIN32
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -744,6 +724,7 @@ int main() {
         return 1;
     }
 #endif
+
     int server_fd, new_socket;
     struct sockaddr_in address;
     int opt = 1;
@@ -840,7 +821,8 @@ int main() {
 
         users[client_id].db_conn = mysql_init(NULL);
         if (!users[client_id].db_conn ||
-            !mysql_real_connect(users[client_id].db_conn, "localhost", "root", "verysecret", "goldfish4c", 0, NULL, 0)) {
+            !mysql_real_connect(users[client_id].db_conn, "localhost", "root", "verysecret", "goldfish4c", 0, NULL, 0))
+        {
             printf("Failed to connect to database for client %d\n", client_id);
             close(new_socket);
             pthread_mutex_lock(&users_mutex);
@@ -883,7 +865,7 @@ int main() {
     return 0;
 }
 
-void init_database() {
+static void init_database(void) {
     global_db_conn = mysql_init(NULL);
     if (!mysql_real_connect(global_db_conn, "localhost", "root", "verysecret", "goldfish4c", 0, NULL, 0)) {
         printf("Failed to initialize global database connection\n");
@@ -893,7 +875,7 @@ void init_database() {
 
 /* -------------------- client handling -------------------- */
 
-void* handle_client(void* arg) {
+static void* handle_client(void* arg) {
     int client_id = *(int*)arg;
     free(arg);
 
@@ -935,7 +917,7 @@ void* handle_client(void* arg) {
     return NULL;
 }
 
-void cleanup_user(int client_id) {
+static void cleanup_user(int client_id) {
     pthread_mutex_lock(&users_mutex);
 
     if (client_id < 0 || client_id >= MAX_CLIENTS) {
@@ -945,10 +927,10 @@ void cleanup_user(int client_id) {
 
     if (users[client_id].used) {
         if (users[client_id].inroom != 0) {
-            // prepared: UPDATE rooms SET inroom = inroom - 1 WHERE id = ?
-            db_update_room_inroom_delta(users[client_id].db_conn, users[client_id].inroom, -1);
+            (void)db_update_room_inroom_delta(users[client_id].db_conn, users[client_id].inroom, -1);
             users[client_id].inroom = 0;
             users[client_id].owner = 0;
+            users[client_id].rights = 0;
         }
 
         if (users[client_id].pathfinding_active) {
@@ -973,36 +955,49 @@ void cleanup_user(int client_id) {
     pthread_mutex_unlock(&users_mutex);
 }
 
-/* -------------------- packet processing -------------------- */
+/* -------------------- packet processing helpers -------------------- */
+
+static void safe_strcat(char *dst, size_t dstsz, const char *src) {
+    if (!dst || !src || dstsz == 0) return;
+    size_t dlen = strlen(dst);
+    if (dlen >= dstsz - 1) return;
+    size_t n = dstsz - 1 - dlen;
+    strncat(dst, src, n);
+}
 
 static int cb_pubs_row(StmtRow *row, void *ud) {
-    // We now SELECT: name, now_in, max_in, mapname, heightmap
-    // Indexes: 0 name, 1 now_in, 2 max_in, 3 mapname, 4 heightmap
+    /* pubs schema: id,name,now_in,max_in,mapname,heightmap
+       our SELECT: name, now_in, max_in, mapname, heightmap
+       idx: 0 name,1 now_in,2 max_in,3 mapname,4 heightmap
+    */
     char *out = (char*)ud;
     if (!out) return 1;
 
     if (row->cols >= 5) {
-        char temp[768];
+        char temp[1024];
         snprintf(temp, sizeof(temp),
             "%s,%s,%s,127.0.0.1/127.0.0.1,37120,%s\t%s,%s,%s,%s\r",
-            row->bufs[0],  // name
-            row->bufs[1],  // now_in
-            row->bufs[2],  // max_in
-            row->bufs[0],  // name again (after port)
-            row->bufs[3],  // mapname
-            row->bufs[1],  // now_in again
-            row->bufs[2],  // max_in again
-            row->bufs[4]   // heightmap
+            row->bufs[0],
+            row->bufs[1],
+            row->bufs[2],
+            row->bufs[0],
+            row->bufs[3],
+            row->bufs[1],
+            row->bufs[2],
+            row->bufs[4]
         );
-
-        strncat(out, temp, 4096 - strlen(out) - 1);
+        safe_strcat(out, BIGBUF_SIZE, temp);
     }
     return 0;
 }
 
-static int cb_rooms_busy_row(StmtRow *row, void *ud) {
-    // We now SELECT: id, name, owner, door, pass, floor, inroom, `desc`
-    // Indexes: 0 id, 1 name, 2 owner, 3 door, 4 pass, 5 floor, 6 inroom, 7 desc
+static int cb_rooms_list_row(StmtRow *row, void *ud) {
+    /* rooms schema (v1.sql):
+       id,name,desc,owner,model,door,pass,wallpaper,floor,inroom,maxusers
+
+       our SELECT: id,name,owner,door,pass,floor,inroom,`desc`
+       idx: 0 id,1 name,2 owner,3 door,4 pass,5 floor,6 inroom,7 desc
+    */
     char *out = (char*)ud;
     if (!out) return 1;
 
@@ -1010,57 +1005,41 @@ static int cb_rooms_busy_row(StmtRow *row, void *ud) {
         char temp[1024];
         snprintf(temp, sizeof(temp),
             "\r%s/%s/%s/%s/%s/%s/127.0.0.1/127.0.0.1/37120/%s/null/%s",
-            row->bufs[0], // id
-            row->bufs[1], // name
-            row->bufs[2], // owner
-            row->bufs[3], // door
-            row->bufs[4], // pass
-            row->bufs[5], // floor
-            row->bufs[6], // inroom
-            row->bufs[7]  // desc
+            row->bufs[0],
+            row->bufs[1],
+            row->bufs[2],
+            row->bufs[3],
+            row->bufs[4],
+            row->bufs[5],
+            row->bufs[6],
+            row->bufs[7]
         );
-
-        strncat(out, temp, 4096 - strlen(out) - 1);
-    }
-    return 0;
-}
-
-typedef struct {
-    int room_id;
-    char out[2048];
-} RoomsForUserCtx;
-
-static int cb_rooms_for_owner_row(StmtRow *row, void *ud) {
-    RoomsForUserCtx *ctx = (RoomsForUserCtx*)ud;
-    if (!ctx) return 1;
-    // original used row[0],row[1],row[3],row[4],row[5],row[6],row[12]
-    if (row->cols >= 13) {
-        char temp[1096];
-        snprintf(temp, sizeof(temp),
-                 "\r%s/%s/%s/%s/%s/%s/127.0.0.1/127.0.0.1/37120/0/null/%s",
-                 row->bufs[0], row->bufs[1], row->bufs[3], row->bufs[4], row->bufs[5], row->bufs[6], row->bufs[12]);
-        strncat(ctx->out, temp, sizeof(ctx->out) - strlen(ctx->out) - 1);
+        safe_strcat(out, BIGBUF_SIZE, temp);
     }
     return 0;
 }
 
 static int cb_buddy_list_row(StmtRow *row, void *ud) {
-    // original: data_name = (strcmp(row[1], me)!=0) ? row[1] : row[2]
-    // and appended "\r1 %s UNKNOW\r"
+    /* buddy schema: id,from,to,accept
+       our SELECT: id, `from`, `to`
+       idx: 0 id,1 from,2 to
+    */
     struct { const char *me; char *out; size_t outsz; } *ctx = ud;
     if (!ctx || !ctx->out) return 1;
+
     if (row->cols >= 3) {
         const char *name = (strcmp(row->bufs[1], ctx->me) != 0) ? row->bufs[1] : row->bufs[2];
         char temp[128];
         snprintf(temp, sizeof(temp), "\r1 %s UNKNOW\r", name);
-        strncat(ctx->out, temp, ctx->outsz - strlen(ctx->out) - 1);
+        safe_strcat(ctx->out, ctx->outsz, temp);
     }
     return 0;
 }
 
-void process_packet(int client_id, char* packet) {
-    char packet_copy[BUFFER_SIZE];
-    // bounded copy (prevents overflow if packet > BUFFER_SIZE)
+/* -------------------- packet processing -------------------- */
+
+static void process_packet(int client_id, char* packet) {
+    char packet_copy[INBUF_SIZE];
     snprintf(packet_copy, sizeof(packet_copy), "%s", packet ? packet : "");
 
     char* token = strtok(packet, " ");
@@ -1138,22 +1117,24 @@ void process_packet(int client_id, char* packet) {
                         "e1026 flower2 10 26 1 2");
 
                     snprintf(users[client_id].roomcache, sizeof(users[client_id].roomcache),
-                             "xxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx");
+                             "xxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx");
 
                     send_data(client_id,
-                        "HEIGHTMAPxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx");
+                        "HEIGHTMAP\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx\rxxxxxxxxxx");
 
-                    char user_packet[512];
-                    snprintf(user_packet, sizeof(user_packet), "USERS\r %s %s 3 5 0 %s",
-                             users[client_id].name,
-                             (strlen(users[client_id].figure) > 7 ? (users[client_id].figure + 7) : users[client_id].figure),
-                             users[client_id].customData);
+                    char user_packet[1024];
+                    const char *fig = users[client_id].figure;
+                    if (strncmp(fig, "figure=", 7) == 0) fig += 7;
+
+                    snprintf(user_packet, sizeof(user_packet),
+                             "USERS\r %s %s 3 5 0 %s",
+                             users[client_id].name, fig, users[client_id].customData);
                     send_data(client_id, user_packet);
 
                     users[client_id].userx = 12;
                     users[client_id].usery = 27;
 
-                    char status_packet[1096];
+                    char status_packet[1024];
                     snprintf(status_packet, sizeof(status_packet), "STATUS \r%s 12,27,1,0,0/mod 0/", users[client_id].name);
                     send_data(client_id, status_packet);
                 }
@@ -1168,7 +1149,7 @@ void process_packet(int client_id, char* packet) {
         if (username && password) {
             load_user_data(client_id, username, password);
 
-            char user_object[4096];
+            char user_object[MIDBUF_SIZE];
             snprintf(user_object, sizeof(user_object),
                      "USEROBJECT\r"
                      "name=%s\r"
@@ -1197,21 +1178,24 @@ void process_packet(int client_id, char* packet) {
         }
     }
     else if (strcmp(token, "INITUNITLISTENER") == 0) {
-        char room_data[4096] = "";
-        stmt_query_each_row(conn, "SELECT name, now_in, max_in, mapname, heightmap FROM pubs", NULL, 0, cb_pubs_row, room_data);
+        char room_data[BIGBUF_SIZE]; room_data[0] = '\0';
+        (void)stmt_query_each_row(conn,
+            "SELECT name, now_in, max_in, mapname, heightmap FROM pubs",
+            NULL, 0, cb_pubs_row, room_data, DB_OUTBUF_MED);
 
-        char all_units[4096];
+        char all_units[BIGBUF_SIZE];
         snprintf(all_units, sizeof(all_units), "ALLUNITS\r%s", room_data);
         send_data(client_id, all_units);
     }
     else if (strcmp(token, "SEARCHBUSYFLATS") == 0) {
-        char room_data[4096] = "";
-		stmt_query_each_row(conn,
-			"SELECT id, name, owner, door, pass, floor, inroom, `desc` "
-			"FROM rooms ORDER BY inroom DESC",
-			NULL, 0, cb_rooms_busy_row, room_data);
+        char room_data[BIGBUF_SIZE]; room_data[0] = '\0';
 
-        char busy_flats[4096];
+        (void)stmt_query_each_row(conn,
+            "SELECT id, name, owner, door, pass, floor, inroom, `desc` "
+            "FROM rooms ORDER BY inroom DESC",
+            NULL, 0, cb_rooms_list_row, room_data, DB_OUTBUF_MED);
+
+        char busy_flats[BIGBUF_SIZE];
         snprintf(busy_flats, sizeof(busy_flats), "BUSY_FLAT_RESULTS 1%s", room_data);
         send_data(client_id, busy_flats);
     }
@@ -1223,57 +1207,58 @@ void process_packet(int client_id, char* packet) {
         send_data(client_id, "MESSENGERREADY \r");
     }
     else if (strcmp(token, "REGISTER") == 0) {
-        char* lines[15];
+        char* lines[20];
         int line_count = 0;
         char* line = strtok(packet_copy, "\r");
-        while (line && line_count < 15) {
+        while (line && line_count < 20) {
             lines[line_count++] = line;
             line = strtok(NULL, "\r");
         }
 
         if (line_count >= 11) {
-            char username[50], password[50], email[1096], figure[1096];
-            char birthday[20], phone[20], mission[1096], agree[10], sex[10], city[50];
+            char username[50]={0}, password[50]={0}, email[255]={0}, figure[255]={0};
+            char birthday[25]={0}, phone[20]={0}, mission[1096]={0}, agree[10]={0}, sex[10]={0}, city[50]={0};
 
             sscanf(lines[0], "REGISTER name=%49s", username);
             sscanf(lines[1], "password=%49s", password);
-            sscanf(lines[2], "email=%99s", email);
-            sscanf(lines[3], "figure=%99s", figure);
-            sscanf(lines[5], "birthday=%19s", birthday);
+            sscanf(lines[2], "email=%254s", email);
+            sscanf(lines[3], "figure=%254s", figure);
+            /* line 4 might exist but unused */
+            sscanf(lines[5], "birthday=%24s", birthday);
             sscanf(lines[6], "phonenumber=%19s", phone);
-            sscanf(lines[7], "customData=%255[^\r]", mission);
+            sscanf(lines[7], "customData=%1095[^\r]", mission);
             sscanf(lines[8], "had_read_agreement=%9s", agree);
             sscanf(lines[9], "sex=%9s", sex);
             sscanf(lines[10], "country=%49s", city);
 
-            db_register_user(conn, username, password, email, figure, birthday, phone, mission, agree, sex, city);
+            (void)db_register_user(conn, username, password, email, figure, birthday, phone, mission, agree, sex, city);
         }
     }
     else if (strcmp(token, "UPDATE") == 0) {
-        char* lines[15];
+        char* lines[20];
         int line_count = 0;
         char* line = strtok(packet_copy, "\r");
-        while (line && line_count < 15) {
+        while (line && line_count < 20) {
             lines[line_count++] = line;
             line = strtok(NULL, "\r");
         }
 
         if (line_count >= 11) {
-            char username[50], password[50], email[1096], figure[1096];
-            char birthday[20], phone[20], mission[1096], agree[10], sex[10], city[50];
+            char username[50]={0}, password[50]={0}, email[255]={0}, figure[255]={0};
+            char birthday[25]={0}, phone[20]={0}, mission[1096]={0}, agree[10]={0}, sex[10]={0}, city[50]={0};
 
             sscanf(lines[0], "UPDATE name=%49s", username);
             sscanf(lines[1], "password=%49s", password);
-            sscanf(lines[2], "email=%99s", email);
-            sscanf(lines[3], "figure=%99s", figure);
-            sscanf(lines[5], "birthday=%19s", birthday);
+            sscanf(lines[2], "email=%254s", email);
+            sscanf(lines[3], "figure=%254s", figure);
+            sscanf(lines[5], "birthday=%24s", birthday);
             sscanf(lines[6], "phonenumber=%19s", phone);
-            sscanf(lines[7], "customData=%255[^\r]", mission);
+            sscanf(lines[7], "customData=%1095[^\r]", mission);
             sscanf(lines[8], "had_read_agreement=%9s", agree);
             sscanf(lines[9], "sex=%9s", sex);
             sscanf(lines[10], "country=%49s", city);
 
-            db_update_user_profile(conn, username, password, email, figure, birthday, phone, agree, city, sex, mission);
+            (void)db_update_user_profile(conn, username, password, email, figure, birthday, phone, agree, city, sex, mission);
         }
     }
     else if (strcmp(token, "SEARCHFLATFORUSER") == 0) {
@@ -1283,18 +1268,16 @@ void process_packet(int client_id, char* packet) {
             char* newline = strchr(user, '\r');
             if (newline) *newline = '\0';
 
-            const char *sql = "SELECT * FROM rooms WHERE owner = ?";
+            const char *sql = "SELECT id, name, owner, door, pass, floor, inroom, `desc` FROM rooms WHERE owner = ?";
             MYSQL_BIND p[1];
             unsigned long lu=0;
             bind_str_in(&p[0], user, &lu);
 
-            RoomsForUserCtx ctx;
-            memset(&ctx, 0, sizeof(ctx));
+            char room_data[BIGBUF_SIZE]; room_data[0] = '\0';
+            (void)stmt_query_each_row(conn, sql, p, 1, cb_rooms_list_row, room_data, DB_OUTBUF_MED);
 
-            stmt_query_each_row(conn, sql, p, 1, cb_rooms_for_owner_row, &ctx);
-
-            char busy_flats[2048];
-            snprintf(busy_flats, sizeof(busy_flats), "BUSY_FLAT_RESULTS 1%s", ctx.out);
+            char busy_flats[BIGBUF_SIZE];
+            snprintf(busy_flats, sizeof(busy_flats), "BUSY_FLAT_RESULTS 1%s", room_data);
             send_data(client_id, busy_flats);
         }
     }
@@ -1305,30 +1288,29 @@ void process_packet(int client_id, char* packet) {
             char* newline = strchr(user, '\r');
             if (newline) *newline = '\0';
 
-            const char *sql = "SELECT * FROM users WHERE name = ? LIMIT 1";
+            const char *sql = "SELECT name, figure, customData, sex FROM users WHERE name = ? LIMIT 1";
             MYSQL_BIND p[1];
             unsigned long lu=0;
             bind_str_in(&p[0], user, &lu);
 
             StmtRow row;
-            int got = stmt_query_first_row(conn, sql, p, 1, &row, 2048);
+            int got = stmt_query_first_row(conn, sql, p, 1, &row, DB_OUTBUF_LARGE);
             if (got == 1) {
-                // original: row[8], row[4]+7, row[10]
-                char member_info[512];
-                const char *custom = (row.cols > 8 ? row.bufs[8] : "");
-                const char *figure = (row.cols > 5 ? row.bufs[5] : "");
-                const char *sex = (row.cols > 10 ? row.bufs[10] : "");
+                const char *uname  = (row.cols > 0 ? row.bufs[0] : user);
+                const char *figure = (row.cols > 1 ? row.bufs[1] : "");
+                const char *custom = (row.cols > 2 ? row.bufs[2] : "");
+                const char *sex    = (row.cols > 3 ? row.bufs[3] : "");
 
-                const char *figure_no_prefix = figure;
-                if (strncmp(figure, "figure=", 7) == 0) figure_no_prefix = figure + 7;
+                if (strncmp(figure, "figure=", 7) == 0) figure += 7;
 
+                char member_info[1024];
                 snprintf(member_info, sizeof(member_info),
                          "MEMBERINFO MESSENGER\r%s\r%s\r\r0\r%s%s",
-                         user, custom, figure_no_prefix, sex);
+                         uname, custom, figure, sex);
                 send_data(client_id, member_info);
                 stmtrow_free(&row);
             } else {
-                char no_such_user[128];
+                char no_such_user[256];
                 snprintf(no_such_user, sizeof(no_such_user), "NOSUCHUSER MESSENGER\r%s", user);
                 send_data(client_id, no_such_user);
             }
@@ -1343,71 +1325,51 @@ void process_packet(int client_id, char* packet) {
         if (flat_id) {
             char* newline = strchr(flat_id, '\r');
             if (newline) *newline = '\0';
-            db_delete_room_by_id(conn, flat_id);
+            (void)db_delete_room_by_id(conn, flat_id);
         }
     }
     else if (strcmp(token, "GET_FAVORITE_ROOMS") == 0) {
-        // NOTE: original did N+1 queries (favrooms then rooms by id). We'll keep logic but prepared.
         char* username = strtok(NULL, " ");
         if (username) {
-            // collect favorite room ids
-            const char *sql_fav = "SELECT * FROM favrooms WHERE user = ?";
+            const char *sql =
+                "SELECT r.id, r.name, r.owner, r.door, r.pass, r.floor, r.inroom, r.`desc` "
+                "FROM favrooms f "
+                "JOIN rooms r ON r.id = f.roomid "
+                "WHERE f.user = ?";
+
             MYSQL_BIND p[1];
             unsigned long lu=0;
             bind_str_in(&p[0], username, &lu);
 
-            // We'll build output by doing inner prepared query per roomid (same as original).
-            // For each fav row, row[2] was room id.
-            struct FavCtx {
-                MYSQL *conn;
-                char out[2048];
-            } favctx;
+            char room_data[BIGBUF_SIZE]; room_data[0] = '\0';
+            (void)stmt_query_each_row(conn, sql, p, 1, cb_rooms_list_row, room_data, DB_OUTBUF_MED);
 
-            favctx.conn = conn;
-            favctx.out[0] = '\0';
-
-            // callback for favrooms rows
-            int fav_cb(StmtRow *r, void *ud) {
-                struct FavCtx *fc = (struct FavCtx*)ud;
-                if (!fc || r->cols < 3) return 0;
-                const char *roomid = r->bufs[2];
-
-                const char *sql_room = "SELECT * FROM rooms WHERE id = ? LIMIT 1";
-                MYSQL_BIND rp[1];
-                unsigned long lr=0;
-                bind_str_in(&rp[0], roomid, &lr);
-
-                StmtRow rr;
-                int got = stmt_query_first_row(fc->conn, sql_room, rp, 1, &rr, 2048);
-                if (got == 1) {
-                    // original used room row[0],row[1],row[3],row[4],row[5],row[6],row[10],row[12]
-                    if (rr.cols >= 13) {
-                        char temp[1096];
-                        snprintf(temp, sizeof(temp),
-                                 "\r%s/%s/%s/%s/%s/%s/127.0.0.1/127.0.0.1/37120/%s/null/%s",
-                                 rr.bufs[0], rr.bufs[1], rr.bufs[3], rr.bufs[4],
-                                 rr.bufs[5], rr.bufs[6], rr.bufs[10], rr.bufs[12]);
-                        strncat(fc->out, temp, sizeof(fc->out) - strlen(fc->out) - 1);
-                    }
-                    stmtrow_free(&rr);
-                }
-                return 0;
-            }
-
-            stmt_query_each_row(conn, sql_fav, p, 1, fav_cb, &favctx);
-
-            char busy_flats[2048];
-            snprintf(busy_flats, sizeof(busy_flats), "BUSY_FLAT_RESULTS 1%s", favctx.out);
+            char busy_flats[BIGBUF_SIZE];
+            snprintf(busy_flats, sizeof(busy_flats), "BUSY_FLAT_RESULTS 1%s", room_data);
             send_data(client_id, busy_flats);
         }
     }
     else if (strcmp(token, "ADD_FAVORITE_ROOM") == 0) {
         char* room_id = strtok(NULL, " ");
-        if (room_id) db_add_favroom(conn, users[client_id].name, room_id);
+        if (room_id) {
+            const char *sql = "INSERT INTO favrooms (user,roomid) VALUES (?,?)";
+            MYSQL_BIND p[2];
+            unsigned long lu=0, lr=0;
+            bind_str_in(&p[0], users[client_id].name, &lu);
+            bind_str_in(&p[1], room_id, &lr);
+            (void)stmt_exec(conn, sql, p, 2);
+        }
     }
     else if (strcmp(token, "DEL_FAVORITE_ROOM") == 0) {
         char* room_id = strtok(NULL, " ");
-        if (room_id) db_del_favroom(conn, room_id);
+        if (room_id) {
+            const char *sql = "DELETE FROM favrooms WHERE user=? AND roomid=? LIMIT 1";
+            MYSQL_BIND p[2];
+            unsigned long lu=0, lr=0;
+            bind_str_in(&p[0], users[client_id].name, &lu);
+            bind_str_in(&p[1], room_id, &lr);
+            (void)stmt_exec(conn, sql, p, 2);
+        }
     }
     else if (strcmp(token, "SEARCHFLAT") == 0) {
         char* search_term = strchr(packet_copy, '/');
@@ -1416,25 +1378,23 @@ void process_packet(int client_id, char* packet) {
             char* newline = strchr(search_term, '\r');
             if (newline) *newline = '\0';
 
-            char like[1096];
+            char like[512];
             snprintf(like, sizeof(like), "%%%s%%", search_term);
 
-            const char *sql = "SELECT * FROM rooms WHERE owner LIKE ? OR name LIKE ?";
+            const char *sql =
+                "SELECT id, name, owner, door, pass, floor, inroom, `desc` "
+                "FROM rooms WHERE owner LIKE ? OR name LIKE ?";
+
             MYSQL_BIND p[2];
             unsigned long l0=0,l1=0;
             bind_str_in(&p[0], like, &l0);
             bind_str_in(&p[1], like, &l1);
 
-            char room_data[2048] = "";
-            stmt_query_each_row(conn, sql, p, 2, cb_rooms_for_owner_row /* compatible indices */, &(RoomsForUserCtx){0});
-            // cb_rooms_for_owner_row writes into ctx.out but we used a temp initializer above incorrectly.
-            // Let's do it properly:
-            RoomsForUserCtx ctx;
-            memset(&ctx, 0, sizeof(ctx));
-            stmt_query_each_row(conn, sql, p, 2, cb_rooms_for_owner_row, &ctx);
+            char room_data[BIGBUF_SIZE]; room_data[0] = '\0';
+            (void)stmt_query_each_row(conn, sql, p, 2, cb_rooms_list_row, room_data, DB_OUTBUF_MED);
 
-            char busy_flats[2048];
-            snprintf(busy_flats, sizeof(busy_flats), "BUSY_FLAT_RESULTS 1%s", ctx.out);
+            char busy_flats[BIGBUF_SIZE];
+            snprintf(busy_flats, sizeof(busy_flats), "BUSY_FLAT_RESULTS 1%s", room_data);
             send_data(client_id, busy_flats);
         }
     }
@@ -1451,12 +1411,13 @@ void process_packet(int client_id, char* packet) {
                 int gotoroom = atoi(flat_id);
 
                 if (users[client_id].inroom != 0) {
-                    db_update_room_inroom_delta(conn, users[client_id].inroom, -1);
+                    (void)db_update_room_inroom_delta(conn, users[client_id].inroom, -1);
                     users[client_id].owner = 0;
+                    users[client_id].rights = 0;
                 }
 
-                db_update_user_inroom(conn, users[client_id].name, gotoroom);
-                db_update_room_inroom_delta(conn, gotoroom, +1);
+                (void)db_update_user_inroom(conn, users[client_id].name, gotoroom);
+                (void)db_update_room_inroom_delta(conn, gotoroom, +1);
 
                 users[client_id].inroom = gotoroom;
                 send_data(client_id, "FLAT_LETIN");
@@ -1472,95 +1433,115 @@ void process_packet(int client_id, char* packet) {
 
             int gotoroom = atoi(flat_id);
 
-            // rooms by id
-            const char *sql_room = "SELECT * FROM rooms WHERE id = ? LIMIT 1";
+            /* rooms schema: id,name,desc,owner,model,door,pass,wallpaper,floor,inroom,maxusers */
+            const char *sql_room =
+                "SELECT id,name,`desc`,owner,model,door,pass,space_w,space_f,inroom,20 AS maxusers "
+                "FROM rooms WHERE id = ? LIMIT 1";
             MYSQL_BIND p[1];
             unsigned long lr=0;
             bind_str_in(&p[0], flat_id, &lr);
 
             StmtRow room;
-            int got = stmt_query_first_row(conn, sql_room, p, 1, &room, 2048);
+            int got = stmt_query_first_row(conn, sql_room, p, 1, &room, DB_OUTBUF_LARGE);
             if (got == 1) {
-                // original uses room[12], room[8], room[9], room[3], room[7]
-                const char *model = (room.cols > 7 ? room.bufs[6] : "");
+                const char *desc  = (room.cols > 2 ? room.bufs[2] : "");
                 const char *owner = (room.cols > 3 ? room.bufs[3] : "");
-                const char *wall = (room.cols > 8 ? room.bufs[8] : "");
-                const char *floor = (room.cols > 9 ? room.bufs[9] : "");
-                const char *desc = (room.cols > 12 ? room.bufs[2] : "");
+                const char *model = (room.cols > 4 ? room.bufs[4] : "");
+                const char *wall  = (room.cols > 7 ? room.bufs[7] : "");
+                const char *floor = (room.cols > 8 ? room.bufs[8] : "");
 
-                char room_ready[1096];
+                char room_ready[1024];
                 snprintf(room_ready, sizeof(room_ready), "ROOM_READY\r%s", desc);
                 send_data(client_id, room_ready);
 
-                char flat_prop1[128];
+                char flat_prop1[256];
                 snprintf(flat_prop1, sizeof(flat_prop1), "FLATPROPERTY\rwallpaper/%s\r", wall);
                 send_data(client_id, flat_prop1);
 
-                char flat_prop2[128];
+                char flat_prop2[256];
                 snprintf(flat_prop2, sizeof(flat_prop2), "FLATPROPERTY\rfloor/%s\r", floor);
                 send_data(client_id, flat_prop2);
+
+                users[client_id].owner = 0;
+                users[client_id].rights = 0;
 
                 if (strcmp(owner, users[client_id].name) == 0) {
                     users[client_id].owner = 1;
                     send_data(client_id, "YOUAREOWNER");
                 }
 
-                // rights check
-                int has = db_has_rights(conn, users[client_id].name);
+                int has = db_has_rights(conn, gotoroom, users[client_id].name);
                 if (has == 1) {
                     users[client_id].rights = 1;
                     send_data(client_id, "YOUARECONTROLLER");
                 }
 
-                // heightmap by model
-                const char *sql_h = "SELECT heightmap FROM heightmap WHERE model = ?";
+                /* heightmap */
+                const char *sql_h = "SELECT heightmap FROM heightmap WHERE model = ? LIMIT 1";
                 MYSQL_BIND hp[1];
                 unsigned long lm=0;
                 bind_str_in(&hp[0], model, &lm);
 
                 StmtRow hm;
-                int hgot = stmt_query_first_row(conn, sql_h, hp, 1, &hm, 2048);
-                if (hgot == 1) {
-                    // heightmap single col at idx 0
-                    snprintf(users[client_id].roomcache, sizeof(users[client_id].roomcache), "%s", hm.bufs[0]);
-                    char heightmap_packet[2048];
-                    snprintf(heightmap_packet, sizeof(heightmap_packet), "HEIGHTMAP\r%s", hm.bufs[0]);
-                    send_data(client_id, heightmap_packet);
-                    stmtrow_free(&hm);
-                }
+                int hgot = stmt_query_first_row(conn, sql_h, hp, 1, &hm, DB_OUTBUF_LARGE);
+				if (hgot == 1) {
+					char *p = hm.bufs[0];
+					while (*p) {
+						if (*p == ' ')
+							*p = '\r';
+						p++;
+					}
 
-                char objects[1096];
+					snprintf(users[client_id].roomcache,
+							 sizeof(users[client_id].roomcache),
+							 "%s", hm.bufs[0]);
+
+					char heightmap_packet[2048];
+					snprintf(heightmap_packet,
+							 sizeof(heightmap_packet),
+							 "HEIGHTMAP\r%s", hm.bufs[0]);
+
+					send_data(client_id, heightmap_packet);
+					stmtrow_free(&hm);
+				}
+
+                char objects[512];
                 snprintf(objects, sizeof(objects), "OBJECTS WORLD 0 %s", model);
                 send_data(client_id, objects);
 
-                // roomitems
-                const char *sql_items = "SELECT * FROM roomitems WHERE roomid = ?";
+                /* roomitems schema: id,roomid,item,shortname,longname,color,xx,yy,zz,rotate,extra */
+                const char *sql_items =
+                    "SELECT id, shortname, xx, yy, zz, rotate, extra, longname, color "
+                    "FROM roomitems WHERE roomid = ?";
                 MYSQL_BIND ip[1];
                 int rid = gotoroom;
                 bind_int_in(&ip[0], &rid);
 
-                char room_items[4096] = "ACTIVE_OBJECTS ";
+                char room_items[BIGBUF_SIZE];
+                snprintf(room_items, sizeof(room_items), "ACTIVE_OBJECTS ");
+
                 int items_cb(StmtRow *r, void *ud) {
                     char *acc = (char*)ud;
                     if (!acc) return 1;
-                    // original uses item_row[0], [3], [9], [10], [7], [11], [8], [4], [5]
-                    if (r->cols >= 12) {
+                    /* idx: 0 id,1 shortname,2 xx,3 yy,4 zz,5 rotate,6 extra,7 longname,8 color */
+                    if (r->cols >= 9) {
                         char temp[512];
                         snprintf(temp, sizeof(temp),
                                  "\r00000000000%s,%s %s %s %s %s 0.0 %s /%s/%s/",
-                                 r->bufs[0], r->bufs[3], r->bufs[9], r->bufs[10],
-                                 r->bufs[7], r->bufs[11], r->bufs[8], r->bufs[4], r->bufs[5]);
-                        strncat(acc, temp, 4096 - strlen(acc) - 1);
+                                 r->bufs[0], r->bufs[1], r->bufs[2], r->bufs[3],
+                                 r->bufs[4], r->bufs[5], r->bufs[6], r->bufs[7], r->bufs[8]);
+                        safe_strcat(acc, BIGBUF_SIZE, temp);
                     }
                     return 0;
                 }
-                stmt_query_each_row(conn, sql_items, ip, 1, items_cb, room_items);
+
+                (void)stmt_query_each_row(conn, sql_items, ip, 1, items_cb, room_items, DB_OUTBUF_MED);
                 send_data(client_id, room_items);
 
                 send_data(client_id, "ITEMS \r6663\tposter\t \tfrontwall 6.9999,6.3500/21");
 
-                // other users in room (excluding me)
-                const char *sql_u = "SELECT * FROM users WHERE inroom = ? AND name != ?";
+                /* other users in room */
+                const char *sql_u = "SELECT name, figure, customData FROM users WHERE inroom = ? AND name != ?";
                 MYSQL_BIND up[2];
                 int inr = gotoroom;
                 unsigned long ln=0;
@@ -1569,56 +1550,57 @@ void process_packet(int client_id, char* packet) {
 
                 int users_cb(StmtRow *r, void *ud) {
                     int cid = *(int*)ud;
-                    // original uses user_row[1], user_row[5]+7, user_row[8]
-                    if (r->cols >= 9) {
-                        const char *uname = r->bufs[1];
-                        const char *fig = r->bufs[5];
-                        const char *custom = r->bufs[8];
+                    if (r->cols >= 3) {
+                        const char *uname = r->bufs[0];
+                        const char *fig = r->bufs[1];
+                        const char *custom = r->bufs[2];
                         if (strncmp(fig, "figure=", 7) == 0) fig += 7;
 
-                        char user_packet[1096];
+                        char user_packet[1024];
                         snprintf(user_packet, sizeof(user_packet), "USERS\r %s %s 3 5 0 %s", uname, fig, custom);
                         send_data(cid, user_packet);
                     }
                     return 0;
                 }
-                stmt_query_each_row(conn, sql_u, up, 2, users_cb, &client_id);
+                (void)stmt_query_each_row(conn, sql_u, up, 2, users_cb, &client_id, DB_OUTBUF_LARGE);
 
-                // statuses
-                if (users[client_id].owner || users[client_id].rights) {
-                    char status_all[1096];
-                    snprintf(status_all, sizeof(status_all), "STATUS \r%s 0,0,99,2,2/flatctrl useradmin/mod 0/", users[client_id].name);
-                    send_data_all(status_all);
+                /* statuses */
+                {
+                    char status_all[1024];
+                    char status_room[1024];
+                    char user_packet[1024];
+                    const char *fig = users[client_id].figure;
+                    if (strncmp(fig, "figure=", 7) == 0) fig += 7;
 
-                    char user_packet[1096];
-                    snprintf(user_packet, sizeof(user_packet), "USERS\r %s %s 3 5 0 %s",
-                             users[client_id].name,
-                             (strncmp(users[client_id].figure, "figure=", 7) == 0 ? users[client_id].figure + 7 : users[client_id].figure),
-                             users[client_id].customData);
-                    send_data_room(gotoroom, user_packet);
+                    if (users[client_id].owner || users[client_id].rights) {
+                        snprintf(status_all, sizeof(status_all),
+                                 "STATUS \r%s 0,0,99,2,2/flatctrl useradmin/mod 0/", users[client_id].name);
+                        send_data_all(status_all);
 
-                    char status_room[1096];
-                    snprintf(status_room, sizeof(status_room), "STATUS \r%s 3,5,0,2,2/flatctrl useradmin/mod 0/", users[client_id].name);
-                    send_data_room(gotoroom, status_room);
-                } else {
-                    char status_all[1096];
-                    snprintf(status_all, sizeof(status_all), "STATUS \r%s 0,0,99,2,2/mod 0/", users[client_id].name);
-                    send_data_all(status_all);
+                        snprintf(user_packet, sizeof(user_packet),
+                                 "USERS\r %s %s 3 5 0 %s", users[client_id].name, fig, users[client_id].customData);
+                        send_data_room(gotoroom, user_packet);
 
-                    char user_packet[1096];
-                    snprintf(user_packet, sizeof(user_packet), "USERS\r %s %s 3 5 0 %s",
-                             users[client_id].name,
-                             (strncmp(users[client_id].figure, "figure=", 7) == 0 ? users[client_id].figure + 7 : users[client_id].figure),
-                             users[client_id].customData);
-                    send_data_room(gotoroom, user_packet);
+                        snprintf(status_room, sizeof(status_room),
+                                 "STATUS \r%s 3,5,0,2,2/flatctrl useradmin/mod 0/", users[client_id].name);
+                        send_data_room(gotoroom, status_room);
+                    } else {
+                        snprintf(status_all, sizeof(status_all),
+                                 "STATUS \r%s 0,0,99,2,2/mod 0/", users[client_id].name);
+                        send_data_all(status_all);
 
-                    char status_room[1096];
-                    snprintf(status_room, sizeof(status_room), "STATUS \r%s 3,5,0,2,2/mod 0/", users[client_id].name);
-                    send_data_room(gotoroom, status_room);
+                        snprintf(user_packet, sizeof(user_packet),
+                                 "USERS\r %s %s 3 5 0 %s", users[client_id].name, fig, users[client_id].customData);
+                        send_data_room(gotoroom, user_packet);
+
+                        snprintf(status_room, sizeof(status_room),
+                                 "STATUS \r%s 3,5,0,2,2/mod 0/", users[client_id].name);
+                        send_data_room(gotoroom, status_room);
+                    }
+
+                    users[client_id].userx = 3;
+                    users[client_id].usery = 5;
                 }
-
-                users[client_id].userx = 3;
-                users[client_id].usery = 5;
 
                 stmtrow_free(&room);
             }
@@ -1629,9 +1611,10 @@ void process_packet(int client_id, char* packet) {
 
         char clean_message[512];
         int j = 0;
-        for (int i = 0; message[i] && i < 511; i++) {
+        for (int i = 0; message[i] && i < (int)sizeof(clean_message)-1; i++) {
             if (message[i] != '\'' && message[i] != '"' && message[i] != '#') {
                 clean_message[j++] = message[i];
+                if (j >= (int)sizeof(clean_message)-1) break;
             }
         }
         clean_message[j] = '\0';
@@ -1644,18 +1627,22 @@ void process_packet(int client_id, char* packet) {
         snprintf(chat_packet, sizeof(chat_packet), "%s\r%s %s", token, users[client_id].name, filtered_message);
         send_data_room(users[client_id].inroom, chat_packet);
 
-        db_insert_chatlog(conn, users[client_id].name, filtered_message, users[client_id].inroom, token);
+        (void)db_insert_chatlog(conn, users[client_id].name, filtered_message, users[client_id].inroom, token);
     }
     else if (strcmp(token, "STATUSOK") == 0) {
         send_data(client_id, "OK");
     }
-    else if (strcmp(token, "MOVE") == 0) {
+    else if (strcmp(token, "Move") == 0) {
         char* x_str = strtok(NULL, " ");
         char* y_str = strtok(NULL, " ");
+	
+		
         if (x_str && y_str) {
             int to_x = atoi(x_str);
             int to_y = atoi(y_str);
-
+			
+			printf("MOVE: %s - %s\n", x_str, y_str);
+		
             pthread_mutex_lock(&users_mutex);
             users[client_id].target_x = to_x;
             users[client_id].target_y = to_y;
@@ -1670,7 +1657,7 @@ void process_packet(int client_id, char* packet) {
         }
     }
     else if (strcmp(token, "GOAWAY") == 0) {
-        char status_packet[1096];
+        char status_packet[1024];
         snprintf(status_packet, sizeof(status_packet), "STATUS \r%s 0,0,99,2,2/mod 0/", users[client_id].name);
         send_data_room(users[client_id].inroom, status_packet);
 
@@ -1679,17 +1666,18 @@ void process_packet(int client_id, char* packet) {
         users[client_id].dance = 0;
 
         if (users[client_id].inroom != 0) {
-            db_update_user_inroom(conn, users[client_id].name, 0);
-            db_update_room_inroom_delta(conn, users[client_id].inroom, -1);
+            (void)db_update_user_inroom(conn, users[client_id].name, 0);
+            (void)db_update_room_inroom_delta(conn, users[client_id].inroom, -1);
 
             users[client_id].inroom = 0;
             users[client_id].owner = 0;
+            users[client_id].rights = 0;
         }
 
         cleanup_user(client_id);
     }
     else if (strcmp(token, "DANCE") == 0) {
-        char status_packet[1096];
+        char status_packet[1024];
         snprintf(status_packet, sizeof(status_packet), "STATUS\r%s %d,%d,0,2,2/dance/",
                  users[client_id].name, users[client_id].userx, users[client_id].usery);
         send_data_room(users[client_id].inroom, status_packet);
@@ -1698,7 +1686,7 @@ void process_packet(int client_id, char* packet) {
     else if (strcmp(token, "STOP") == 0) {
         char* stop_type = strtok(NULL, " ");
         if (stop_type && strcmp(stop_type, "DANCE") == 0) {
-            char status_packet[1096];
+            char status_packet[1024];
             snprintf(status_packet, sizeof(status_packet), "STATUS\r%s %d,%d,0,2,2/",
                      users[client_id].name, users[client_id].userx, users[client_id].usery);
             send_data_room(users[client_id].inroom, status_packet);
@@ -1708,19 +1696,20 @@ void process_packet(int client_id, char* packet) {
     else if (strcmp(token, "GETORDERINFO") == 0) {
         char* item_name = strtok(NULL, " ");
         if (item_name) {
-            const char *sql = "SELECT * FROM catalogue WHERE shortname = ? LIMIT 1";
+            /* catalogue schema: id,shortname,longname,item,short,type,color,extra,price */
+            const char *sql = "SELECT longname, price FROM catalogue WHERE shortname = ? LIMIT 1";
             MYSQL_BIND p[1];
             unsigned long li=0;
             bind_str_in(&p[0], item_name, &li);
 
             StmtRow row;
-            int got = stmt_query_first_row(conn, sql, p, 1, &row, 2048);
+            int got = stmt_query_first_row(conn, sql, p, 1, &row, DB_OUTBUF_MED);
             if (got == 1) {
-                // original uses row[2], row[3]
-                const char *a = (row.cols > 2 ? row.bufs[2] : "");
-                const char *b = (row.cols > 3 ? row.bufs[3] : "");
-                char order_info[1096];
-                snprintf(order_info, sizeof(order_info), "ORDERINFO\r%s/%s/\r%s", a, b, b);
+                const char *lname = (row.cols > 0 ? row.bufs[0] : "");
+                const char *price = (row.cols > 1 ? row.bufs[1] : "0");
+
+                char order_info[1024];
+                snprintf(order_info, sizeof(order_info), "ORDERINFO\r%s/%s/\r%s", lname, price, price);
                 send_data(client_id, order_info);
                 stmtrow_free(&row);
             }
@@ -1729,61 +1718,51 @@ void process_packet(int client_id, char* packet) {
     else if (strcmp(token, "GETSTRIP") == 0) {
         char* strip_type = strtok(NULL, " ");
         if (strip_type) {
+            int offset = 0;
+            int count = 11;
+
             if (strcmp(strip_type, "new") == 0) {
-                const char *sql = "SELECT * FROM useritems WHERE user = ? LIMIT 0,11";
-                MYSQL_BIND p[1];
-                unsigned long lu=0;
-                bind_str_in(&p[0], users[client_id].name, &lu);
-
-                char item_info[2048] = "";
-
-                int strip_cb(StmtRow *r, void *ud) {
-                    char *acc = (char*)ud;
-                    // original uses row[0], row[3], row[4], row[5]
-                    if (r->cols >= 6) {
-                        char temp[1096];
-                        snprintf(temp, sizeof(temp), "BLSI;%s;0;S;%s;%s;%s;%s;1;1;0,0,0/\r",
-                                 r->bufs[0], r->bufs[0], r->bufs[3], r->bufs[4], r->bufs[5]);
-                        strncat(acc, temp, 2048 - strlen(acc) - 1);
-                    }
-                    return 0;
-                }
-                stmt_query_each_row(conn, sql, p, 1, strip_cb, item_info);
-
-                users[client_id].handcache = 11;
-                char strip_info[2048];
-                snprintf(strip_info, sizeof(strip_info), "STRIPINFO\r%s", item_info);
-                send_data(client_id, strip_info);
+                users[client_id].handcache = 0;
+                offset = 0;
+            } else if (strcmp(strip_type, "next") == 0) {
+                offset = users[client_id].handcache;
             }
-            else if (strcmp(strip_type, "next") == 0) {
-                int start = users[client_id].handcache;
-                int end = start + 11;
+			
+            const char *sql =
+                "SELECT id, shortname, longname, color, extra "
+                "FROM useritems WHERE user = ? LIMIT ?,?";
 
-                const char *sql = "SELECT * FROM useritems WHERE user = ? LIMIT ?,?";
-                MYSQL_BIND p[3];
-                unsigned long lu=0;
-                bind_str_in(&p[0], users[client_id].name, &lu);
-                bind_int_in(&p[1], &start);
-                bind_int_in(&p[2], &end);
+            MYSQL_BIND p[3];
+            unsigned long lu=0;
+            bind_str_in(&p[0], users[client_id].name, &lu);
+            bind_int_in(&p[1], &offset);
+            bind_int_in(&p[2], &count);
 
-                char item_info[2048] = "";
-                int strip_cb(StmtRow *r, void *ud) {
-                    char *acc = (char*)ud;
-                    if (r->cols >= 6) {
-                        char temp[1096];
-                        snprintf(temp, sizeof(temp), "BLSI;%s;0;S;%s;%s;%s;%s;1;1;0,0,0/\r",
-                                 r->bufs[0], r->bufs[0], r->bufs[3], r->bufs[4], r->bufs[5]);
-                        strncat(acc, temp, 2048 - strlen(acc) - 1);
-                    }
-                    return 0;
+            char item_info[BIGBUF_SIZE]; item_info[0] = '\0';
+
+            int strip_cb(StmtRow *r, void *ud) {
+                char *acc = (char*)ud;
+                /* useritems schema: id,user,item,shortname,longname,color,extra
+                   our SELECT: id, shortname, longname, color, extra
+                   idx: 0 id,1 shortname,2 longname,3 color,4 extra
+                */
+                if (r->cols >= 5) {
+                    char temp[1024];
+                    snprintf(temp, sizeof(temp),
+                             "BLSI;%s;0;S;%s;%s;%s;%s;1;1;0,0,0/\r",
+                             r->bufs[0], r->bufs[0], r->bufs[1], r->bufs[2], r->bufs[3]);
+                    safe_strcat(acc, BIGBUF_SIZE, temp);
                 }
-                stmt_query_each_row(conn, sql, p, 3, strip_cb, item_info);
-
-                users[client_id].handcache = end;
-                char strip_info[2048];
-                snprintf(strip_info, sizeof(strip_info), "STRIPINFO\r%s", item_info);
-                send_data(client_id, strip_info);
+                return 0;
             }
+
+            (void)stmt_query_each_row(conn, sql, p, 3, strip_cb, item_info, DB_OUTBUF_MED);
+
+            users[client_id].handcache = offset + count;
+
+            char strip_info[BIGBUF_SIZE];
+            snprintf(strip_info, sizeof(strip_info), "STRIPINFO\r%s", item_info);
+            send_data(client_id, strip_info);
         }
     }
     else if (strcmp(token, "PURCHASE") == 0) {
@@ -1791,47 +1770,51 @@ void process_packet(int client_id, char* packet) {
         item_name = item_name ? (item_name + 1) : NULL;
         if (item_name) {
             char* price_str = strchr(item_name, '/');
+            if (price_str) *price_str = '\0'; /* split at / */
             price_str = price_str ? (price_str + 1) : NULL;
             if (price_str) {
                 char* newline = strchr(price_str, '\r');
                 if (newline) *newline = '\0';
+            }
 
-                const char *sql = "SELECT * FROM catalogue WHERE longname = ? LIMIT 1";
-                MYSQL_BIND p[1];
-                unsigned long ln=0;
-                bind_str_in(&p[0], item_name, &ln);
+            /* catalogue schema: id,shortname,longname,item,short,type,color,extra,price */
+            const char *sql =
+                "SELECT item, shortname, longname, color, extra, price "
+                "FROM catalogue WHERE longname = ? LIMIT 1";
+            MYSQL_BIND p[1];
+            unsigned long ln=0;
+            bind_str_in(&p[0], item_name, &ln);
 
-                StmtRow row;
-                int got = stmt_query_first_row(conn, sql, p, 1, &row, 2048);
-                if (got == 1) {
-                    int price = atoi(price_str);
+            StmtRow row;
+            int got = stmt_query_first_row(conn, sql, p, 1, &row, DB_OUTBUF_LARGE);
+            if (got == 1) {
+                int price = (row.cols > 5 ? atoi(row.bufs[5]) : 0);
 
-                    // original insert useritems: (NULL, user, row[2],row[3],row[4],row[5],row[6],row[1])
-                    const char *sql_ins = "INSERT INTO useritems VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)";
-                    MYSQL_BIND ip[7];
-                    unsigned long lu=0,l2=0,l3=0,l4=0,l5=0,l6=0,l1=0;
-                    bind_str_in(&ip[0], users[client_id].name, &lu);
-                    bind_str_in(&ip[1], (row.cols>2?row.bufs[2]:""), &l2);
-                    bind_str_in(&ip[2], (row.cols>3?row.bufs[3]:""), &l3);
-                    bind_str_in(&ip[3], (row.cols>4?row.bufs[4]:""), &l4);
-                    bind_str_in(&ip[4], (row.cols>5?row.bufs[5]:""), &l5);
-                    bind_str_in(&ip[5], (row.cols>6?row.bufs[6]:""), &l6);
-                    bind_str_in(&ip[6], (row.cols>1?row.bufs[1]:""), &l1);
-                    stmt_exec(conn, sql_ins, ip, 7);
+                const char *sql_ins =
+                    "INSERT INTO useritems (user,item,shortname,longname,color,extra) "
+                    "VALUES (?,?,?,?,?,?)";
+                MYSQL_BIND ip[6];
+                unsigned long lu=0,litem=0,ls=0,ll=0,lc=0,le=0;
 
-                    // update credits
-                    const char *sql_up = "UPDATE users SET credits = credits - ? WHERE name = ?";
-                    MYSQL_BIND up[2];
-                    unsigned long luser=0;
-                    bind_int_in(&up[0], &price);
-                    bind_str_in(&up[1], users[client_id].name, &luser);
-                    stmt_exec(conn, sql_up, up, 2);
+                bind_str_in(&ip[0], users[client_id].name, &lu);
+                bind_str_in(&ip[1], (row.cols>0?row.bufs[0]:""), &litem);
+                bind_str_in(&ip[2], (row.cols>1?row.bufs[1]:""), &ls);
+                bind_str_in(&ip[3], (row.cols>2?row.bufs[2]:""), &ll);
+                bind_str_in(&ip[4], (row.cols>3?row.bufs[3]:""), &lc);
+                bind_str_in(&ip[5], (row.cols>4?row.bufs[4]:""), &le);
+                (void)stmt_exec(conn, sql_ins, ip, 6);
 
-                    users[client_id].credits -= price;
-                    send_data(client_id, "SYSTEMBROADCAST\rBuying successful !");
+                const char *sql_up = "UPDATE users SET credits = credits - ? WHERE name = ?";
+                MYSQL_BIND up[2];
+                unsigned long luser=0;
+                bind_int_in(&up[0], &price);
+                bind_str_in(&up[1], users[client_id].name, &luser);
+                (void)stmt_exec(conn, sql_up, up, 2);
 
-                    stmtrow_free(&row);
-                }
+                users[client_id].credits -= price;
+                send_data(client_id, "SYSTEMBROADCAST\rBuying successful !");
+
+                stmtrow_free(&row);
             }
         }
     }
@@ -1839,24 +1822,31 @@ void process_packet(int client_id, char* packet) {
         char* flat_data = strchr(packet_copy, '/');
         flat_data = flat_data ? (flat_data + 1) : NULL;
         if (flat_data) {
-            char* name = flat_data;
-            char* model = strchr(name, '/'); model = model ? (model + 1) : NULL;
-            char* door  = model ? strchr(model, '/') : NULL; door = door ? (door + 1) : NULL;
-            char* pass  = door ? strchr(door, '/') : NULL; pass = pass ? (pass + 1) : NULL;
+            char *name = flat_data;
+            char *model = strchr(name, '/'); if (model) { *model = '\0'; model++; }
+            char *door  = model ? strchr(model, '/') : NULL; if (door) { *door = '\0'; door++; }
+            char *pass  = door ? strchr(door, '/') : NULL; if (pass) { *pass = '\0'; pass++; }
 
-            if (pass) {
+            if (name && model && door && pass) {
                 char* newline = strchr(pass, '\r');
                 if (newline) *newline = '\0';
 
                 const char *sql =
-                    "INSERT INTO rooms VALUES (NULL, ?, '', ?, 'floor1', '0', ?, ?, '', '100', '100')";
-                MYSQL_BIND p[4];
-                unsigned long l0=0,l1=0,l2=0,l3=0;
+                    "INSERT INTO rooms (name,`desc`,owner,model,door,pass,space_w,space_f,inroom,maxusers) "
+                    "VALUES (?,?,?, ?,?,?, ?,?,0)";
+                MYSQL_BIND p[8];
+                unsigned long l0=0,l1=0,l2=0,l3=0,l4=0,l5=0,l6=0,l7=0;
+
                 bind_str_in(&p[0], name, &l0);
-                bind_str_in(&p[1], users[client_id].name, &l1);
-                bind_str_in(&p[2], door ? door : "", &l2);
-                bind_str_in(&p[3], pass, &l3);
-                stmt_exec(conn, sql, p, 4);
+                bind_str_in(&p[1], "", &l1);
+                bind_str_in(&p[2], users[client_id].name, &l2);
+                bind_str_in(&p[3], model, &l3);
+                bind_str_in(&p[4], door, &l4);
+                bind_str_in(&p[5], pass, &l5);
+                bind_str_in(&p[6], "0", &l6);
+                bind_str_in(&p[7], "0", &l7);
+
+                (void)stmt_exec(conn, sql, p, 8);
             }
         }
     }
@@ -1865,7 +1855,7 @@ void process_packet(int client_id, char* packet) {
         if (buddy_name) {
             char* newline = strchr(buddy_name, '\r');
             if (newline) *newline = '\0';
-            db_buddy_request(conn, users[client_id].name, buddy_name);
+            (void)db_buddy_request(conn, users[client_id].name, buddy_name);
         }
     }
     else if (strcmp(token, "MESSENGER_ACCEPTBUDDY") == 0) {
@@ -1873,7 +1863,7 @@ void process_packet(int client_id, char* packet) {
         if (buddy_name) {
             char* newline = strchr(buddy_name, '\r');
             if (newline) *newline = '\0';
-            db_buddy_accept(conn, buddy_name, users[client_id].name);
+            (void)db_buddy_accept(conn, buddy_name, users[client_id].name);
         }
     }
     else if (strcmp(token, "MESSENGER_DECLINEBUDDY") == 0) {
@@ -1881,24 +1871,24 @@ void process_packet(int client_id, char* packet) {
         if (buddy_name) {
             char* newline = strchr(buddy_name, '\r');
             if (newline) *newline = '\0';
-            db_buddy_decline(conn, buddy_name, users[client_id].name);
+            (void)db_buddy_decline(conn, buddy_name, users[client_id].name);
         }
     }
     else if (strcmp(token, "MESSENGERINIT") == 0) {
-        // SELECT * FROM buddy WHERE (`to` LIKE me AND accept=1) OR (`from` LIKE me AND accept=1)
         const char *sql =
-            "SELECT * FROM buddy WHERE (`to` LIKE ? AND `accept`='1') OR (`from` LIKE ? AND `accept`='1')";
+            "SELECT id, `from`, `to` FROM buddy "
+            "WHERE ((`to` = ? AND `accept`='1') OR (`from` = ? AND `accept`='1'))";
         MYSQL_BIND p[2];
         unsigned long l0=0,l1=0;
         bind_str_in(&p[0], users[client_id].name, &l0);
         bind_str_in(&p[1], users[client_id].name, &l1);
 
-        char buddy_data[1024] = "";
+        char buddy_data[MIDBUF_SIZE]; buddy_data[0] = '\0';
         struct { const char *me; char *out; size_t outsz; } ctx = { users[client_id].name, buddy_data, sizeof(buddy_data) };
 
-        stmt_query_each_row(conn, sql, p, 2, cb_buddy_list_row, &ctx);
+        (void)stmt_query_each_row(conn, sql, p, 2, cb_buddy_list_row, &ctx, DB_OUTBUF_MED);
 
-        char buddy_list[1024];
+        char buddy_list[MIDBUF_SIZE];
         snprintf(buddy_list, sizeof(buddy_list), "BUDDYLIST%s", buddy_data);
         send_data(client_id, buddy_list);
     }
@@ -1907,65 +1897,73 @@ void process_packet(int client_id, char* packet) {
         if (buddy_name) {
             char* newline = strchr(buddy_name, '\r');
             if (newline) *newline = '\0';
-            db_buddy_remove_pair(conn, buddy_name, users[client_id].name);
+            (void)db_buddy_remove_pair(conn, buddy_name, users[client_id].name);
         }
     }
     else if (strcmp(token, "PLACESTUFFFROMSTRIP") == 0) {
-        // (still prepared; schema unknown, but logic preserved)
         char* item_id = strtok(NULL, " ");
         char* x_str = strtok(NULL, " ");
         char* y_str = strtok(NULL, " ");
 
         if (item_id && x_str && y_str) {
-            // select useritems by id
-            const char *sql_u = "SELECT * FROM useritems WHERE id = ? LIMIT 1";
+            /* useritems: id,user,item,shortname,longname,color,extra */
+            const char *sql_u = "SELECT item, shortname, longname, color, extra FROM useritems WHERE id = ? LIMIT 1";
             MYSQL_BIND p[1];
             unsigned long lid=0;
             bind_str_in(&p[0], item_id, &lid);
 
             StmtRow it;
-            int got = stmt_query_first_row(conn, sql_u, p, 1, &it, 2048);
+            int got = stmt_query_first_row(conn, sql_u, p, 1, &it, DB_OUTBUF_LARGE);
             if (got == 1) {
-                // insert into roomitems values (NULL, inroom, row[3]..row[8], '0', x, y)
+                /* roomitems: id,roomid,item,shortname,longname,color,xx,yy,zz,rotate,extra */
                 const char *sql_ins =
-                    "INSERT INTO roomitems VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, '0', ?, ?)";
-                MYSQL_BIND ip[9];
-                int roomid = users[client_id].inroom;
-                unsigned long l3=0,l4=0,l5=0,l6=0,l7=0,l8=0,lx=0,ly=0;
-                bind_int_in(&ip[0], &roomid);
-                bind_str_in(&ip[1], (it.cols>3?it.bufs[3]:""), &l3);
-                bind_str_in(&ip[2], (it.cols>4?it.bufs[4]:""), &l4);
-                bind_str_in(&ip[3], (it.cols>5?it.bufs[5]:""), &l5);
-                bind_str_in(&ip[4], (it.cols>6?it.bufs[6]:""), &l6);
-                bind_str_in(&ip[5], (it.cols>7?it.bufs[7]:""), &l7);
-                bind_str_in(&ip[6], (it.cols>8?it.bufs[8]:""), &l8);
-                bind_str_in(&ip[7], x_str, &lx);
-                bind_str_in(&ip[8], y_str, &ly);
-                stmt_exec(conn, sql_ins, ip, 9);
+                    "INSERT INTO roomitems (roomid,item,shortname,longname,color,xx,yy,zz,rotate,extra) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)";
 
+                MYSQL_BIND ip[10];
+                int roomid = users[client_id].inroom;
+                int xx = atoi(x_str);
+                int yy = atoi(y_str);
+                int zz = 0;
+                int rot = 0;
+
+                unsigned long litem=0, ls=0, ll=0, lc=0, le=0;
+                bind_int_in(&ip[0], &roomid);
+                bind_str_in(&ip[1], (it.cols>0?it.bufs[0]:""), &litem);
+                bind_str_in(&ip[2], (it.cols>1?it.bufs[1]:""), &ls);
+                bind_str_in(&ip[3], (it.cols>2?it.bufs[2]:""), &ll);
+                bind_str_in(&ip[4], (it.cols>3?it.bufs[3]:""), &lc);
+                bind_int_in(&ip[5], &xx);
+                bind_int_in(&ip[6], &yy);
+                bind_int_in(&ip[7], &zz);
+                bind_int_in(&ip[8], &rot);
+                bind_str_in(&ip[9], (it.cols>4?it.bufs[4]:""), &le);
+
+                (void)stmt_exec(conn, sql_ins, ip, 10);
                 stmtrow_free(&it);
             }
 
-            // delete useritems by id
-            const char *sql_del = "DELETE FROM useritems WHERE id = ?";
-            stmt_exec(conn, sql_del, p, 1);
+            /* delete from strip */
+            const char *sql_del = "DELETE FROM useritems WHERE id = ? LIMIT 1";
+            (void)stmt_exec(conn, sql_del, p, 1);
 
-            // select last inserted room item for room
-            const char *sql_last = "SELECT * FROM roomitems WHERE roomid = ? ORDER BY id DESC LIMIT 1";
+            /* fetch last inserted for room */
+            const char *sql_last =
+                "SELECT id, shortname, xx, yy, zz, rotate, extra, longname, color "
+                "FROM roomitems WHERE roomid = ? ORDER BY id DESC LIMIT 1";
             MYSQL_BIND lp[1];
             int rid = users[client_id].inroom;
             bind_int_in(&lp[0], &rid);
 
             StmtRow rr;
-            int got2 = stmt_query_first_row(conn, sql_last, lp, 1, &rr, 2048);
+            int got2 = stmt_query_first_row(conn, sql_last, lp, 1, &rr, DB_OUTBUF_LARGE);
             if (got2 == 1) {
-                // original formats ACTIVE_OBJECTS
-                if (rr.cols >= 12) {
-                    char room_items[512];
+                if (rr.cols >= 9) {
+                    char room_items[1024];
                     snprintf(room_items, sizeof(room_items),
                              "ACTIVE_OBJECTS \r00000000000%s,%s %s %s %s %s 0.0 %s /%s/%s/",
-                             rr.bufs[0], rr.bufs[3], rr.bufs[9], rr.bufs[10],
-                             rr.bufs[7], rr.bufs[11], rr.bufs[8], rr.bufs[4], rr.bufs[5]);
+                             rr.bufs[0], rr.bufs[1], rr.bufs[2], rr.bufs[3],
+                             rr.bufs[4], rr.bufs[5], rr.bufs[6], rr.bufs[7], rr.bufs[8]);
                     send_data_room(users[client_id].inroom, room_items);
                 }
                 stmtrow_free(&rr);
@@ -1979,31 +1977,37 @@ void process_packet(int client_id, char* packet) {
         char* rotate_str = strtok(NULL, " ");
 
         if (item_id && x_str && y_str && rotate_str) {
-            const char *sql_up = "UPDATE roomitems SET x=?, y=?, rotate=? WHERE id=? LIMIT 1";
-            MYSQL_BIND p[4];
-            unsigned long lx=0,ly=0,lr=0,li=0;
-            bind_str_in(&p[0], x_str, &lx);
-            bind_str_in(&p[1], y_str, &ly);
-            bind_str_in(&p[2], rotate_str, &lr);
-            bind_str_in(&p[3], item_id, &li);
-            stmt_exec(conn, sql_up, p, 4);
-
-            const char *sql_sel = "SELECT * FROM roomitems WHERE roomid=? AND id=? LIMIT 1";
-            MYSQL_BIND sp[2];
+            const char *sql_up = "UPDATE roomitems SET xx=?, yy=?, rotate=? WHERE id=? AND roomid=? LIMIT 1";
+            MYSQL_BIND p[5];
+            int xx = atoi(x_str);
+            int yy = atoi(y_str);
+            int rot = atoi(rotate_str);
+            int idv = atoi(item_id);
             int rid = users[client_id].inroom;
-            unsigned long lid=0;
+
+            bind_int_in(&p[0], &xx);
+            bind_int_in(&p[1], &yy);
+            bind_int_in(&p[2], &rot);
+            bind_int_in(&p[3], &idv);
+            bind_int_in(&p[4], &rid);
+            (void)stmt_exec(conn, sql_up, p, 5);
+
+            const char *sql_sel =
+                "SELECT id, shortname, xx, yy, zz, rotate, extra, longname, color "
+                "FROM roomitems WHERE roomid=? AND id=? LIMIT 1";
+            MYSQL_BIND sp[2];
             bind_int_in(&sp[0], &rid);
-            bind_str_in(&sp[1], item_id, &lid);
+            bind_int_in(&sp[1], &idv);
 
             StmtRow rr;
-            int got = stmt_query_first_row(conn, sql_sel, sp, 2, &rr, 2048);
+            int got = stmt_query_first_row(conn, sql_sel, sp, 2, &rr, DB_OUTBUF_LARGE);
             if (got == 1) {
-                if (rr.cols >= 12) {
-                    char room_items[512];
+                if (rr.cols >= 9) {
+                    char room_items[1024];
                     snprintf(room_items, sizeof(room_items),
                              "ACTIVEOBJECT_UPDATE \r00000000000%s,%s %s %s %s %s 0.0 %s /%s/%s/",
-                             rr.bufs[0], rr.bufs[3], rr.bufs[9], rr.bufs[10],
-                             rr.bufs[7], rr.bufs[11], rr.bufs[8], rr.bufs[4], rr.bufs[5]);
+                             rr.bufs[0], rr.bufs[1], rr.bufs[2], rr.bufs[3],
+                             rr.bufs[4], rr.bufs[5], rr.bufs[6], rr.bufs[7], rr.bufs[8]);
                     send_data_room(users[client_id].inroom, room_items);
                 }
                 stmtrow_free(&rr);
@@ -2013,74 +2017,82 @@ void process_packet(int client_id, char* packet) {
     else if (strcmp(token, "REMOVESTUFF") == 0) {
         char* item_id = strtok(NULL, " ");
         if (item_id) {
-            const char *sql_sel = "SELECT * FROM roomitems WHERE roomid=? AND id=? LIMIT 1";
-            MYSQL_BIND sp[2];
+            int idv = atoi(item_id);
             int rid = users[client_id].inroom;
-            unsigned long lid=0;
+
+            const char *sql_sel =
+                "SELECT id, shortname, xx, yy, zz, rotate, extra, longname, color "
+                "FROM roomitems WHERE roomid=? AND id=? LIMIT 1";
+            MYSQL_BIND sp[2];
             bind_int_in(&sp[0], &rid);
-            bind_str_in(&sp[1], item_id, &lid);
+            bind_int_in(&sp[1], &idv);
 
             StmtRow rr;
-            int got = stmt_query_first_row(conn, sql_sel, sp, 2, &rr, 2048);
+            int got = stmt_query_first_row(conn, sql_sel, sp, 2, &rr, DB_OUTBUF_LARGE);
             if (got == 1) {
-                if (rr.cols >= 12) {
-                    char room_items[512];
+                if (rr.cols >= 9) {
+                    char room_items[1024];
                     snprintf(room_items, sizeof(room_items),
                              "ACTIVEOBJECT_UPDATE \r00000000000%s,%s 99 99 %s %s 0.0 %s /%s/%s/",
-                             rr.bufs[0], rr.bufs[3], rr.bufs[7], rr.bufs[11], rr.bufs[8], rr.bufs[4], rr.bufs[5]);
+                             rr.bufs[0], rr.bufs[1], rr.bufs[4], rr.bufs[5], rr.bufs[6], rr.bufs[7], rr.bufs[8]);
                     send_data_room(users[client_id].inroom, room_items);
                 }
                 stmtrow_free(&rr);
             }
 
-            const char *sql_del = "DELETE FROM roomitems WHERE id=? LIMIT 1";
-            MYSQL_BIND dp[1];
-            unsigned long l=0;
-            bind_str_in(&dp[0], item_id, &l);
-            stmt_exec(conn, sql_del, dp, 1);
+            const char *sql_del = "DELETE FROM roomitems WHERE id=? AND roomid=? LIMIT 1";
+            MYSQL_BIND dp[2];
+            bind_int_in(&dp[0], &idv);
+            bind_int_in(&dp[1], &rid);
+            (void)stmt_exec(conn, sql_del, dp, 2);
         }
     }
     else if (strcmp(token, "ADDSTRIPITEM") == 0) {
         char* item_id = strtok(NULL, " ");
-        strtok(NULL, " ");
+        (void)strtok(NULL, " "); /* unused */
         char* room_item_id = strtok(NULL, " ");
 
         if (item_id && room_item_id) {
-            const char *sql_sel = "SELECT * FROM roomitems WHERE roomid=? AND id=? LIMIT 1";
-            MYSQL_BIND sp[2];
             int rid = users[client_id].inroom;
-            unsigned long lri=0;
+            int roomidv = atoi(room_item_id);
+
+            const char *sql_sel =
+                "SELECT item, shortname, longname, color, extra "
+                "FROM roomitems WHERE roomid=? AND id=? LIMIT 1";
+            MYSQL_BIND sp[2];
             bind_int_in(&sp[0], &rid);
-            bind_str_in(&sp[1], room_item_id, &lri);
+            bind_int_in(&sp[1], &roomidv);
 
             StmtRow rr;
-            int got = stmt_query_first_row(conn, sql_sel, sp, 2, &rr, 2048);
+            int got = stmt_query_first_row(conn, sql_sel, sp, 2, &rr, DB_OUTBUF_LARGE);
             if (got == 1) {
-                if (rr.cols >= 12) {
-                    char room_items[512];
-                    snprintf(room_items, sizeof(room_items),
-                             "ACTIVEOBJECT_UPDATE \r00000000000%s,%s 99 99 %s %s 0.0 %s /%s/%s/",
-                             rr.bufs[0], rr.bufs[3], rr.bufs[7], rr.bufs[11], rr.bufs[8], rr.bufs[4], rr.bufs[5]);
-                    send_data_room(users[client_id].inroom, room_items);
+                /* send removal update to room (best-effort) */
+                {
+                    char upd[512];
+                    snprintf(upd, sizeof(upd),
+                             "ACTIVEOBJECT_UPDATE \r00000000000%d,%s 99 99 0 0 0.0  / / /",
+                             roomidv, (rr.cols>1?rr.bufs[1]:""));
+                    send_data_room(users[client_id].inroom, upd);
                 }
 
-                const char *sql_ins = "INSERT INTO useritems VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)";
-                MYSQL_BIND ip[7];
-                unsigned long lu=0,l3=0,l4=0,l5=0,l6=0,l7=0,l8=0;
-                bind_str_in(&ip[0], users[client_id].name, &lu);
-                bind_str_in(&ip[1], (rr.cols>3?rr.bufs[3]:""), &l3);
-                bind_str_in(&ip[2], (rr.cols>4?rr.bufs[4]:""), &l4);
-                bind_str_in(&ip[3], (rr.cols>5?rr.bufs[5]:""), &l5);
-                bind_str_in(&ip[4], (rr.cols>6?rr.bufs[6]:""), &l6);
-                bind_str_in(&ip[5], (rr.cols>7?rr.bufs[7]:""), &l7);
-                bind_str_in(&ip[6], (rr.cols>8?rr.bufs[8]:""), &l8);
-                stmt_exec(conn, sql_ins, ip, 7);
+                const char *sql_ins =
+                    "INSERT INTO useritems (user,item,shortname,longname,color,extra) VALUES (?,?,?,?,?,?)";
+                MYSQL_BIND ip[6];
+                unsigned long lu=0,litem=0,ls=0,ll=0,lc=0,le=0;
 
-                const char *sql_del = "DELETE FROM roomitems WHERE id=? LIMIT 1";
-                MYSQL_BIND dp[1];
-                unsigned long ld=0;
-                bind_str_in(&dp[0], room_item_id, &ld);
-                stmt_exec(conn, sql_del, dp, 1);
+                bind_str_in(&ip[0], users[client_id].name, &lu);
+                bind_str_in(&ip[1], (rr.cols>0?rr.bufs[0]:""), &litem);
+                bind_str_in(&ip[2], (rr.cols>1?rr.bufs[1]:""), &ls);
+                bind_str_in(&ip[3], (rr.cols>2?rr.bufs[2]:""), &ll);
+                bind_str_in(&ip[4], (rr.cols>3?rr.bufs[3]:""), &lc);
+                bind_str_in(&ip[5], (rr.cols>4?rr.bufs[4]:""), &le);
+                (void)stmt_exec(conn, sql_ins, ip, 6);
+
+                const char *sql_del = "DELETE FROM roomitems WHERE id=? AND roomid=? LIMIT 1";
+                MYSQL_BIND dp[2];
+                bind_int_in(&dp[0], &roomidv);
+                bind_int_in(&dp[1], &rid);
+                (void)stmt_exec(conn, sql_del, dp, 2);
 
                 stmtrow_free(&rr);
             }
@@ -2093,8 +2105,8 @@ void process_packet(int client_id, char* packet) {
             int to_x = atoi(x_str);
             int to_y = atoi(y_str);
 
-            char own_data[50] = "";
-            if (users[client_id].owner) strcpy(own_data, "flatctrl useradmin/");
+            char own_data[64] = "";
+            if (users[client_id].owner || users[client_id].rights) strcpy(own_data, "flatctrl useradmin/");
 
             int rx = 2, ry = 2;
             if (users[client_id].userx > to_x && users[client_id].usery > to_y) { rx = 7; ry = 7; }
@@ -2106,7 +2118,7 @@ void process_packet(int client_id, char* packet) {
             else if (users[client_id].usery > to_y) { rx = 0; ry = 0; }
             else if (users[client_id].usery < to_y) { rx = 4; ry = 4; }
 
-            char status_packet[1096];
+            char status_packet[1024];
             if (users[client_id].dance) {
                 snprintf(status_packet, sizeof(status_packet),
                          "STATUS\r%s %d,%d,%d,%d,%d/%sdance/",
@@ -2148,7 +2160,7 @@ void process_packet(int client_id, char* packet) {
             char* newline = strchr(target_user, '\r');
             if (newline) *newline = '\0';
 
-            db_rights_insert(conn, users[client_id].inroom, target_user);
+            (void)db_rights_insert(conn, users[client_id].inroom, target_user);
 
             pthread_mutex_lock(&users_mutex);
             for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -2167,7 +2179,7 @@ void process_packet(int client_id, char* packet) {
         if (target_user) {
             char* newline = strchr(target_user, '\r');
             if (newline) *newline = '\0';
-            db_rights_delete(conn, users[client_id].inroom, target_user);
+            (void)db_rights_delete(conn, users[client_id].inroom, target_user);
         }
     }
     else if (strcmp(token, "UPDATEFLAT") == 0) {
@@ -2175,10 +2187,10 @@ void process_packet(int client_id, char* packet) {
         flat_data = flat_data ? (flat_data + 1) : NULL;
         if (flat_data) {
             char* flat_id = flat_data;
-            char* name = strchr(flat_id, '/'); name = name ? (name + 1) : NULL;
-            char* door = name ? strchr(name, '/') : NULL; door = door ? (door + 1) : NULL;
+            char* name = strchr(flat_id, '/'); if (name) { *name = '\0'; name++; }
+            char* door = name ? strchr(name, '/') : NULL; if (door) { *door = '\0'; door++; }
 
-            if (door) {
+            if (flat_id && name && door) {
                 char* newline = strchr(door, '\r');
                 if (newline) *newline = '\0';
 
@@ -2188,7 +2200,7 @@ void process_packet(int client_id, char* packet) {
                 bind_str_in(&p[0], name, &ln);
                 bind_str_in(&p[1], door, &ld);
                 bind_str_in(&p[2], flat_id, &lid);
-                stmt_exec(conn, sql, p, 3);
+                (void)stmt_exec(conn, sql, p, 3);
             }
         }
     }
@@ -2197,24 +2209,22 @@ void process_packet(int client_id, char* packet) {
         flat_data = flat_data ? (flat_data + 1) : NULL;
         if (flat_data) {
             char* flat_id = flat_data;
-            char* info_data = strchr(flat_id, '/'); info_data = info_data ? (info_data + 1) : NULL;
+            char* info_data = strchr(flat_id, '/'); if (info_data) { *info_data = '\0'; info_data++; }
 
-            if (info_data) {
+            if (flat_id && info_data) {
                 char* newline = strchr(info_data, '\r');
                 if (newline) *newline = '\0';
 
-                char desc[1096], password[1096];
-                memset(desc, 0, sizeof(desc));
-                memset(password, 0, sizeof(password));
-                sscanf(info_data, "desc=%255[^/]/password=%99s", desc, password);
+                char desc[512]={0}, password[128]={0};
+                sscanf(info_data, "desc=%511[^/]/password=%127s", desc, password);
 
-                const char *sql = "UPDATE rooms SET `desc`=?, pass=? WHERE id=?";
+                const char *sql = "UPDATE rooms SET `desc`=?, pass=? WHERE id=? LIMIT 1";
                 MYSQL_BIND p[3];
                 unsigned long ld=0, lp=0, lid=0;
                 bind_str_in(&p[0], desc, &ld);
                 bind_str_in(&p[1], password, &lp);
                 bind_str_in(&p[2], flat_id, &lid);
-                stmt_exec(conn, sql, p, 3);
+                (void)stmt_exec(conn, sql, p, 3);
             }
         }
     }
@@ -2222,33 +2232,33 @@ void process_packet(int client_id, char* packet) {
 
 /* -------------------- load user data wrapper -------------------- */
 
-void load_user_data(int client_id, const char* username, const char* password) {
-    db_load_user_data(users[client_id].db_conn, username, password, &users[client_id]);
+static void load_user_data(int client_id, const char* username, const char* password) {
+    (void)db_load_user_data(users[client_id].db_conn, username, password, &users[client_id]);
 }
 
 /* -------------------- send helpers -------------------- */
 
-void send_data(int client_id, const char* data) {
+static void send_data(int client_id, const char* data) {
     if (client_id < 0 || client_id >= MAX_CLIENTS) return;
     if (!users[client_id].used || users[client_id].socket == INVALID_SOCKET) return;
-    send_cmd(&users[client_id], data);
+    (void)send_cmd(&users[client_id], data);
 }
 
-void send_data_all(const char* data) {
+static void send_data_all(const char* data) {
     pthread_mutex_lock(&users_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (users[i].used && users[i].socket != INVALID_SOCKET) {
-            send_cmd(&users[i], data);
+            (void)send_cmd(&users[i], data);
         }
     }
     pthread_mutex_unlock(&users_mutex);
 }
 
-void send_data_room(int room_id, const char* data) {
+static void send_data_room(int room_id, const char* data) {
     pthread_mutex_lock(&users_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (users[i].used && users[i].inroom == room_id && users[i].socket != INVALID_SOCKET) {
-            send_cmd(&users[i], data);
+            (void)send_cmd(&users[i], data);
         }
     }
     pthread_mutex_unlock(&users_mutex);
@@ -2256,12 +2266,12 @@ void send_data_room(int room_id, const char* data) {
 
 /* -------------------- stubs -------------------- */
 
-void load_wordfilters() { }
-char* filter_chat_message(char* message) { return message; }
+static void load_wordfilters(void) { }
+static char* filter_chat_message(char* message) { return message; }
 
 /* -------------------- pathfinding -------------------- */
 
-void* pathfinding_thread(void* arg) {
+static void* pathfinding_thread(void* arg) {
     int client_id = *(int*)arg;
 
     pthread_mutex_lock(&users_mutex);
@@ -2298,8 +2308,8 @@ void* pathfinding_thread(void* arg) {
 
         int height = get_room_height(new_x, new_y, users[client_id].roomcache);
 
-        char status_packet[1096];
-        char own_data[50] = "";
+        char status_packet[1024];
+        char own_data[64] = "";
         pthread_mutex_lock(&users_mutex);
         if (users[client_id].owner || users[client_id].rights) strcpy(own_data, "flatctrl useradmin/");
         pthread_mutex_unlock(&users_mutex);
@@ -2320,7 +2330,7 @@ void* pathfinding_thread(void* arg) {
     return NULL;
 }
 
-int get_room_height(int x, int y, char* heightmap) {
+static int get_room_height(int x, int y, char* heightmap) {
     (void)heightmap;
     if (x >= 0 && x < 10 && y >= 0 && y < 28) return 1;
     return 0;
