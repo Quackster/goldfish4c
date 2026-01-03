@@ -1,34 +1,3 @@
-/*
-    Server.c — MySQL C API (MYSQL_STMT) prepared statements for ALL DB operations.
-
-    Fixes in this version (per your request):
-    - Integrated with the actual DB schema from v1.sql (no more SELECT * index mismatches).
-    - Fixed row index usage everywhere (rooms/roomitems/useritems/catalogue/etc).
-    - Fixed buffers to support DB field sizes + safer concatenation.
-    - Fixed STRIP paging (LIMIT offset,count; not offset,end).
-    - Removed broken SEARCHFLAT callback usage and simplified room list formatting.
-    - Rewrote FAVORITES using a JOIN (no N+1).
-    - PURCHASE now uses catalogue.price from DB (prevents client price spoofing).
-    - Room item packets now map to the v1.sql roomitems columns:
-        id, shortname, xx, yy, zz, rotate, extra, longname, color
-
-    Logging additions in this version (per your request):
-    - Verbose logging with multiple modules.
-    - Define flags at the top to toggle each module on/off.
-    - Thread-safe log output with timestamps and file:line tagging.
-
-    Changes in THIS edit (per your request):
-    - Removed duplicate/contradictory pathfinding thread cleanup/join logic (single persistent worker thread per user).
-    - Replaced greedy stepping pathfinding with proper A* pathfinding (8-dir, octile heuristic, optional corner-cut prevention).
-
-    Build:
-      gcc server.c -o server -lmysqlclient -lpthread
-*/
-
-/* ==================== VERBOSE LOGGING FLAGS (toggle on/off) ====================
-   Set to 1 to enable that module’s logs, 0 to disable.
-   Tip: keep LOG_ERR on unless you *really* want silence.
-*/
 #define LOG_ERR     1   /* errors/warnings */
 #define LOG_NET     1   /* sockets/connect/disconnect */
 #define LOG_PROTO   1   /* raw protocol send/recv */
