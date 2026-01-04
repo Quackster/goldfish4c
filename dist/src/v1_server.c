@@ -100,7 +100,19 @@
 #include <mysql/mysql.h>
 
 #define MAX_CLIENTS 150
-#define INVALID_SOCKET -1
+#ifdef _WIN32
+  #include <winsock2.h>
+  typedef SOCKET socket_t;
+  #define SOCKET_INVALID INVALID_SOCKET
+  #define socket_close closesocket
+#else
+  #include <sys/types.h>
+  #include <sys/socket.h>
+  #include <unistd.h>
+  typedef int socket_t;
+  #define SOCKET_INVALID (-1)
+  #define socket_close close
+#endif
 
 /* Protocol safety:
    - the wire format uses a 4-digit length header => max 9999 bytes.
@@ -2525,38 +2537,39 @@ static void send_data_room(int room_id, const char* data) {
 
 static void load_wordfilters(void) { }
 static char* filter_chat_message(char* message) { return message; }
-
 /* -------------------- pathfinding -------------------- */
 
-/* -------------------- mv status helpers -------------------- */
+/* -------------------- movement/status helpers -------------------- */
 
-/* Direction -> rx/ry mapping (matches your C# example)
-   dx,dy:
-     -1,-1 => 7,7
-     -1,+1 => 5,5
-     +1,-1 => 1,1
-     +1,+1 => 3,3
-     -1, 0 => 6,6
-     +1, 0 => 2,2
-      0,-1 => 0,0
-      0,+1 => 4,4
+/*
+  Direction -> rotation index (matches your C# example)
+  dx,dy:
+    -1,-1 => 7
+    -1,+1 => 5
+    +1,-1 => 1
+    +1,+1 => 3
+    -1, 0 => 6
+    +1, 0 => 2
+     0,-1 => 0
+     0,+1 => 4
 */
-static void calc_rxry_from_step(int dx, int dy, int *rx, int *ry) {
-    int r = 2;
-    if (dx < 0 && dy < 0) r = 7;
-    else if (dx < 0 && dy > 0) r = 5;
-    else if (dx > 0 && dy < 0) r = 1;
-    else if (dx > 0 && dy > 0) r = 3;
-    else if (dx < 0)         r = 6;
-    else if (dx > 0)         r = 2;
-    else if (dy < 0)         r = 0;
-    else if (dy > 0)         r = 4;
-    *rx = r;
-    *ry = r;
+static int step_dir_to_rot(int dx, int dy)
+{
+    if (dx < 0 && dy < 0) return 7;
+    if (dx < 0 && dy > 0) return 5;
+    if (dx > 0 && dy < 0) return 1;
+    if (dx > 0 && dy > 0) return 3;
+    if (dx < 0)           return 6;
+    if (dx > 0)           return 2;
+    if (dy < 0)           return 0;
+    if (dy > 0)           return 4;
+    return 2; /* default facing */
 }
 
-static void build_own_data(int client_id, char *out, size_t outsz) {
+static void build_user_status_flags(int client_id, char *out, size_t outsz)
+{
     if (!out || outsz == 0) return;
+
     out[0] = '\0';
     pthread_mutex_lock(&users_mutex);
     if (users[client_id].owner || users[client_id].rights) {
@@ -2565,57 +2578,27 @@ static void build_own_data(int client_id, char *out, size_t outsz) {
     pthread_mutex_unlock(&users_mutex);
 }
 
-static void send_final_status_no_mv(int client_id, int room_id,
-                                   int x, int y, int z,
-                                   int rx, int ry,
-                                   int dancing)
+/* Queue the final non-mv STATUS to be sent on the NEXT tick */
+static void queue_final_stand_status_next_tick(int client_id, int room_id,
+                                               int x, int y, int z,
+                                               int rx, int ry,
+                                               int dancing)
 {
-    char own_data[64];
-    build_own_data(client_id, own_data, sizeof(own_data));
-
-    char status_packet[1024];
-
-    if (dancing) {
-        snprintf(status_packet, sizeof(status_packet),
-                 "STATUS \r%s %d,%d,%d,%d,%d/%sdance/",
-                 users[client_id].name,
-                 x, y, z, rx, ry,
-                 own_data);
-    } else {
-        snprintf(status_packet, sizeof(status_packet),
-                 "STATUS \r%s %d,%d,%d,%d,%d/%s",
-                 users[client_id].name,
-                 x, y, z, rx, ry,
-                 own_data);
-    }
-
-    send_data_room(room_id, status_packet);
-}
-
-static void on_stopped_walking(int client_id, int room_id,
-                              int x, int y, int z,
-                              int rx, int ry,
-                              int dancing)
-{
-    /* Queue the final non-mv STATUS to be sent on the NEXT tick */
     pthread_mutex_lock(&users_mutex);
     if (client_id >= 0 && client_id < MAX_CLIENTS && users[client_id].used) {
-        users[client_id].stop_pending   = 1;
-        users[client_id].stop_room_id   = room_id;
-        users[client_id].stop_x         = x;
-        users[client_id].stop_y         = y;
-        users[client_id].stop_z         = z;
-        users[client_id].stop_rx        = rx;
-        users[client_id].stop_ry        = ry;
-        users[client_id].stop_dancing   = dancing;
+        users[client_id].stop_pending = 1;
+        users[client_id].stop_room_id = room_id;
+        users[client_id].stop_x       = x;
+        users[client_id].stop_y       = y;
+        users[client_id].stop_z       = z;
+        users[client_id].stop_rx      = rx;
+        users[client_id].stop_ry      = ry;
+        users[client_id].stop_dancing = dancing;
     }
-	
-	
-	printf ("User stopped walking\n");
     pthread_mutex_unlock(&users_mutex);
 }
 
-static void flush_stopped_walking_if_pending(int client_id)
+static void flush_final_stand_status_if_pending(int client_id)
 {
     int pending = 0;
     int room_id = 0, x = 0, y = 0, z = 0, rx = 2, ry = 2, dancing = 0;
@@ -2624,41 +2607,62 @@ static void flush_stopped_walking_if_pending(int client_id)
     if (client_id >= 0 && client_id < MAX_CLIENTS && users[client_id].used) {
         pending = users[client_id].stop_pending;
         if (pending) {
-            room_id  = users[client_id].stop_room_id;
-            x        = users[client_id].stop_x;
-            y        = users[client_id].stop_y;
-            z        = users[client_id].stop_z;
-            rx       = users[client_id].stop_rx;
-            ry       = users[client_id].stop_ry;
-            dancing  = users[client_id].stop_dancing;
+            room_id = users[client_id].stop_room_id;
+            x       = users[client_id].stop_x;
+            y       = users[client_id].stop_y;
+            z       = users[client_id].stop_z;
+            rx      = users[client_id].stop_rx;
+            ry      = users[client_id].stop_ry;
+            dancing = users[client_id].stop_dancing;
 
             users[client_id].stop_pending = 0; /* consume */
         }
     }
     pthread_mutex_unlock(&users_mutex);
 
-    if (pending && room_id != 0) {
-        send_final_status_no_mv(client_id, room_id, x, y, z, rx, ry, dancing);
+    if (!pending || room_id == 0) return;
+
+    /* inlined (was send_final_status_no_mv) */
+    {
+        char own_data[64];
+        build_user_status_flags(client_id, own_data, sizeof(own_data));
+
+        char status_packet[1024];
+        if (dancing) {
+            snprintf(status_packet, sizeof(status_packet),
+                     "STATUS \r%s %d,%d,%d,%d,%d/%sdance/",
+                     users[client_id].name,
+                     x, y, z, rx, ry,
+                     own_data);
+        } else {
+            snprintf(status_packet, sizeof(status_packet),
+                     "STATUS \r%s %d,%d,%d,%d,%d/%s",
+                     users[client_id].name,
+                     x, y, z, rx, ry,
+                     own_data);
+        }
+        send_data_room(room_id, status_packet);
     }
 }
 
-
-static int tile_occupied_by_user(int room_id, int x, int y, int except_client_id) {
-    int occ = 0;
+static int is_tile_occupied_by_other_user(int room_id, int x, int y, int except_client_id)
+{
+    int occupied = 0;
     pthread_mutex_lock(&users_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!users[i].used) continue;
         if (i == except_client_id) continue;
         if (users[i].inroom != room_id) continue;
-        if (users[i].userx == x && users[i].usery == y) { occ = 1; break; }
+        if (users[i].userx == x && users[i].usery == y) { occupied = 1; break; }
     }
     pthread_mutex_unlock(&users_mutex);
-    return occ;
+    return occupied;
 }
 
 /* -------------------- heightmap helpers -------------------- */
 
-static int hm_get_dims(const char *hm, int *w, int *h) {
+static int hm_get_dims(const char *hm, int *w, int *h)
+{
     if (!hm || !w || !h) return -1;
 
     int width = 0;
@@ -2669,7 +2673,6 @@ static int hm_get_dims(const char *hm, int *w, int *h) {
     int height = 0;
     p = hm;
     while (*p) {
-        /* count non-empty rows */
         int rowlen = 0;
         while (*p && *p != '\r' && *p != '\n') { rowlen++; p++; }
         if (rowlen > 0) height++;
@@ -2682,25 +2685,21 @@ static int hm_get_dims(const char *hm, int *w, int *h) {
     return 0;
 }
 
-static const char* hm_row_ptr(const char *hm, int row) {
-    const char *p = hm;
-    int r = 0;
-    while (*p && r < row) {
-        while (*p && *p != '\r' && *p != '\n') p++;
-        while (*p == '\r' || *p == '\n') p++;
-        r++;
-    }
-    return p;
-}
-
-static int hm_height_at(const char *hm, int x, int y) {
+static int hm_height_at(const char *hm, int x, int y)
+{
     if (!hm) return -1;
 
     int w = 0, h = 0;
     if (hm_get_dims(hm, &w, &h) != 0) return -1;
     if (x < 0 || y < 0 || x >= w || y >= h) return -1;
 
-    const char *row = hm_row_ptr(hm, y);
+    /* inline row pointer (was hm_row_ptr) */
+    const char *p = hm;
+    for (int r = 0; r < y && *p; r++) {
+        while (*p && *p != '\r' && *p != '\n') p++;
+        while (*p == '\r' || *p == '\n') p++;
+    }
+    const char *row = p;
     if (!row || !row[0]) return -1;
 
     char c = row[x];
@@ -2711,24 +2710,17 @@ static int hm_height_at(const char *hm, int x, int y) {
     if (c >= 'A' && c <= 'Z') return 10 + (int)(c - 'A');
     if (c >= 'a' && c <= 'z') return 10 + (int)(c - 'a');
 
-    /* unknown tile => treat as blocked */
-    return -1;
+    return -1; /* unknown tile => blocked */
 }
 
-static int get_room_height(int x, int y, char* heightmap) {
-    return hm_height_at(heightmap, x, y);
-}
+/* NOTE: Removed get_room_height() wrapper because it only forwarded to hm_height_at()
+   (If you call get_room_height() elsewhere, keep it or update those callsites.) */
 
 /* -------------------- A* pathfinding -------------------- */
 
-typedef struct {
-    int x, y;
-} PFPoint;
+typedef struct { int x, y; } PFPoint;
 
-typedef struct {
-    int idx;
-    int f;
-} HeapItem;
+typedef struct { int idx; int f; } HeapItem;
 
 typedef struct {
     HeapItem *a;
@@ -2736,13 +2728,15 @@ typedef struct {
     int cap;
 } MinHeap;
 
-static void heap_init(MinHeap *h, int cap) {
+static void heap_init(MinHeap *h, int cap)
+{
     h->a = (HeapItem*)malloc(sizeof(HeapItem) * (size_t)cap);
     h->n = 0;
     h->cap = (h->a ? cap : 0);
 }
 
-static void heap_free(MinHeap *h) {
+static void heap_free(MinHeap *h)
+{
     if (!h) return;
     free(h->a);
     h->a = NULL;
@@ -2750,15 +2744,19 @@ static void heap_free(MinHeap *h) {
     h->cap = 0;
 }
 
-static void heap_swap(HeapItem *x, HeapItem *y) {
+static inline void heap_swap(HeapItem *x, HeapItem *y)
+{
     HeapItem t = *x; *x = *y; *y = t;
 }
 
-static void heap_push(MinHeap *h, int idx, int f) {
+static void heap_push(MinHeap *h, int idx, int f)
+{
     if (!h || !h->a || h->n >= h->cap) return;
+
     int i = h->n++;
     h->a[i].idx = idx;
     h->a[i].f = f;
+
     while (i > 0) {
         int p = (i - 1) / 2;
         if (h->a[p].f <= h->a[i].f) break;
@@ -2767,10 +2765,12 @@ static void heap_push(MinHeap *h, int idx, int f) {
     }
 }
 
-static int heap_pop(MinHeap *h, int *out_idx, int *out_f) {
+static int heap_pop(MinHeap *h, int *out_idx, int *out_f)
+{
     if (!h || !h->a || h->n <= 0) return 0;
+
     if (out_idx) *out_idx = h->a[0].idx;
-    if (out_f) *out_f = h->a[0].f;
+    if (out_f)   *out_f   = h->a[0].f;
 
     h->n--;
     h->a[0] = h->a[h->n];
@@ -2780,55 +2780,75 @@ static int heap_pop(MinHeap *h, int *out_idx, int *out_f) {
         int l = i * 2 + 1;
         int r = i * 2 + 2;
         int s = i;
+
         if (l < h->n && h->a[l].f < h->a[s].f) s = l;
         if (r < h->n && h->a[r].f < h->a[s].f) s = r;
         if (s == i) break;
+
         heap_swap(&h->a[i], &h->a[s]);
         i = s;
     }
     return 1;
 }
 
-static int octile_heuristic_cost(int x0, int y0, int x1, int y1) {
+static int octile_heuristic_cost(int x0, int y0, int x1, int y1)
+{
     int dx = x0 - x1; if (dx < 0) dx = -dx;
     int dy = y0 - y1; if (dy < 0) dy = -dy;
     int dmin = (dx < dy) ? dx : dy;
     int dmax = (dx > dy) ? dx : dy;
-    /* cost: 10 straight, 14 diagonal */
-    return 14 * dmin + 10 * (dmax - dmin);
+    return 14 * dmin + 10 * (dmax - dmin); /* 10 straight, 14 diagonal */
 }
 
-static int in_bounds(int x, int y, int w, int h) {
+static inline int in_bounds(int x, int y, int w, int h)
+{
     return (x >= 0 && y >= 0 && x < w && y < h);
 }
 
-static int passable_tile(int client_id, int room_id, const char *hm, int x, int y) {
+static int is_passable_tile(int client_id, int room_id, const char *hm, int x, int y)
+{
     int z = hm_height_at(hm, x, y);
     if (z < 0) return 0;
-    if (tile_occupied_by_user(room_id, x, y, client_id)) return 0;
+    if (is_tile_occupied_by_other_user(room_id, x, y, client_id)) return 0;
     return 1;
 }
 
-/* Prevent cutting corners when moving diagonally: require both orthogonal neighbors passable too. */
-static int passable_step(int client_id, int room_id, const char *hm,
-                         int fromx, int fromy, int tox, int toy)
+/* Prevent corner cutting on diagonal moves. */
+static int is_passable_step(int client_id, int room_id, const char *hm,
+                            int fromx, int fromy, int tox, int toy)
 {
-    int dx = tox - fromx;
-    int dy = toy - fromy;
+    const int dx = tox - fromx;
+    const int dy = toy - fromy;
 
-    if (!passable_tile(client_id, room_id, hm, tox, toy)) return 0;
+    if (!is_passable_tile(client_id, room_id, hm, tox, toy)) return 0;
 
     if (dx != 0 && dy != 0) {
-        /* diagonal move: also require (fromx+dx, fromy) and (fromx, fromy+dy) passable */
-        if (!passable_tile(client_id, room_id, hm, fromx + dx, fromy)) return 0;
-        if (!passable_tile(client_id, room_id, hm, fromx, fromy + dy)) return 0;
+        if (!is_passable_tile(client_id, room_id, hm, fromx + dx, fromy)) return 0;
+        if (!is_passable_tile(client_id, room_id, hm, fromx, fromy + dy)) return 0;
     }
+
+    /* Height check */
+    {
+        const int from_z = hm_height_at(hm, fromx, fromy);
+        const int to_z   = hm_height_at(hm, tox, toy);
+
+        if (from_z < 0 || to_z < 0)
+            return 0;
+
+        /* Tune these values to your ruleset */
+        const int MAX_ASCEND = 1;  /* stepping up */
+        const int MAX_DROP   = 2;  /* stepping down */
+
+        const int dz = to_z - from_z;
+
+        if (dz > MAX_ASCEND || dz < -MAX_DROP)
+            return 0;
+    }
+
     return 1;
 }
 
-/* A* returns number of points in path (including start+goal) OR 0 if none.
-   Caller provides out_path with capacity max_path.
-*/
+/* A* returns number of points in path (including start+goal) OR 0 if none. */
 static int astar_find_path(int client_id, int room_id, const char *hm,
                            int sx, int sy, int gx, int gy,
                            PFPoint *out_path, int max_path)
@@ -2837,42 +2857,39 @@ static int astar_find_path(int client_id, int room_id, const char *hm,
     if (hm_get_dims(hm, &w, &h) != 0) return 0;
     if (!in_bounds(sx, sy, w, h) || !in_bounds(gx, gy, w, h)) return 0;
 
-    if (!passable_tile(client_id, room_id, hm, sx, sy)) return 0;
-    if (!passable_tile(client_id, room_id, hm, gx, gy)) return 0;
+    if (!is_passable_tile(client_id, room_id, hm, sx, sy)) return 0;
+    if (!is_passable_tile(client_id, room_id, hm, gx, gy)) return 0;
 
-    int n = w * h;
-    int *gscore = (int*)malloc(sizeof(int) * (size_t)n);
-    int *came   = (int*)malloc(sizeof(int) * (size_t)n);
+    const int n = w * h;
+    const int INF = 0x3fffffff;
+
+    int     *gscore = (int*)malloc(sizeof(int) * (size_t)n);
+    int     *came   = (int*)malloc(sizeof(int) * (size_t)n);
     uint8_t *closed = (uint8_t*)malloc((size_t)n);
-    uint8_t *opened = (uint8_t*)malloc((size_t)n);
 
-    if (!gscore || !came || !closed || !opened) {
-        free(gscore); free(came); free(closed); free(opened);
+    if (!gscore || !came || !closed) {
+        free(gscore); free(came); free(closed);
         return 0;
     }
 
-    const int INF = 0x3fffffff;
     for (int i = 0; i < n; i++) {
         gscore[i] = INF;
         came[i] = -1;
         closed[i] = 0;
-        opened[i] = 0;
     }
 
-    int sidx = sy * w + sx;
-    int gidx = gy * w + gx;
+    const int sidx = sy * w + sx;
+    const int gidx = gy * w + gx;
 
     MinHeap heap;
     heap_init(&heap, n);
     if (!heap.a) {
-        free(gscore); free(came); free(closed); free(opened);
+        free(gscore); free(came); free(closed);
         return 0;
     }
 
     gscore[sidx] = 0;
-    int f0 = octile_heuristic_cost(sx, sy, gx, gy);
-    heap_push(&heap, sidx, f0);
-    opened[sidx] = 1;
+    heap_push(&heap, sidx, octile_heuristic_cost(sx, sy, gx, gy));
 
     static const int dirs[8][2] = {
         { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
@@ -2882,58 +2899,58 @@ static int astar_find_path(int client_id, int room_id, const char *hm,
     int found = 0;
 
     while (heap.n > 0) {
-        int cur = -1, curf = 0;
-        if (!heap_pop(&heap, &cur, &curf)) break;
-        if (cur < 0 || cur >= n) continue;
+        int cur = -1;
+        if (!heap_pop(&heap, &cur, NULL)) break;
+        if ((unsigned)cur >= (unsigned)n) continue;
 
         if (closed[cur]) continue;
         closed[cur] = 1;
 
         if (cur == gidx) { found = 1; break; }
 
-        int cx = cur % w;
-        int cy = cur / w;
+        const int cx = cur % w;
+        const int cy = cur / w;
 
         for (int di = 0; di < 8; di++) {
-            int nx = cx + dirs[di][0];
-            int ny = cy + dirs[di][1];
+            const int nx = cx + dirs[di][0];
+            const int ny = cy + dirs[di][1];
             if (!in_bounds(nx, ny, w, h)) continue;
 
-            int nidx = ny * w + nx;
+            const int nidx = ny * w + nx;
             if (closed[nidx]) continue;
 
-            if (!passable_step(client_id, room_id, hm, cx, cy, nx, ny)) continue;
+            if (!is_passable_step(client_id, room_id, hm, cx, cy, nx, ny)) continue;
 
-            int step_cost = (dirs[di][0] != 0 && dirs[di][1] != 0) ? 14 : 10;
-            int tg = gscore[cur] + step_cost;
+            const int step_cost = (dirs[di][0] != 0 && dirs[di][1] != 0) ? 14 : 10;
+            const int tg = gscore[cur] + step_cost;
+
             if (tg < gscore[nidx]) {
                 gscore[nidx] = tg;
                 came[nidx] = cur;
-                int nf = tg + octile_heuristic_cost(nx, ny, gx, gy);
+
+                const int nf = tg + octile_heuristic_cost(nx, ny, gx, gy);
                 heap_push(&heap, nidx, nf);
-                opened[nidx] = 1;
             }
         }
     }
 
     int path_len = 0;
     if (found) {
-        /* reconstruct backwards */
         int cur = gidx;
         while (cur != -1 && path_len < max_path) {
-            int x = cur % w;
-            int y = cur / w;
-            out_path[path_len].x = x;
-            out_path[path_len].y = y;
+            out_path[path_len].x = cur % w;
+            out_path[path_len].y = cur / w;
             path_len++;
             if (cur == sidx) break;
             cur = came[cur];
         }
-        /* if we didn't reach start, treat as fail */
-        if (path_len == 0 || out_path[path_len-1].x != sx || out_path[path_len-1].y != sy) {
+
+        if (path_len == 0 ||
+            out_path[path_len - 1].x != sx ||
+            out_path[path_len - 1].y != sy)
+        {
             path_len = 0;
         } else {
-            /* reverse to start->goal */
             for (int i = 0; i < path_len / 2; i++) {
                 PFPoint tmp = out_path[i];
                 out_path[i] = out_path[path_len - 1 - i];
@@ -2946,25 +2963,24 @@ static int astar_find_path(int client_id, int room_id, const char *hm,
     free(gscore);
     free(came);
     free(closed);
-    free(opened);
 
     return path_len;
 }
 
-static void* pathfinding_thread(void* arg) {
-    int client_id = (int)(intptr_t)arg;
+static void* pathfinding_thread(void* arg)
+{
+    const int client_id = (int)(intptr_t)arg;
 
     int last_seq = -1;
 
-    /* Path buffer kept local to thread */
     PFPoint path[2048];
     int path_len = 0;
     int path_pos = 0;
 
     for (;;) {
-		/* If we queued a stop last tick, send it now (one tick later) */
-        flush_stopped_walking_if_pending(client_id);
-		
+        /* If we queued a stop last tick, send it now (one tick later). */
+        flush_final_stand_status_if_pending(client_id);
+
         int should_exit = 0;
         int active = 0;
         int seq = 0;
@@ -2981,27 +2997,26 @@ static void* pathfinding_thread(void* arg) {
         active      = users[client_id].pathfinding_active;
         seq         = users[client_id].pathfinding_seq;
 
-        room_id   = users[client_id].inroom;
-        cx        = users[client_id].userx;
-        cy        = users[client_id].usery;
-        cz        = users[client_id].userz;
-        dancing   = users[client_id].dance;
+        room_id = users[client_id].inroom;
+        cx      = users[client_id].userx;
+        cy      = users[client_id].usery;
+        cz      = users[client_id].userz;
+        dancing = users[client_id].dance;
 
-        tx        = users[client_id].target_x;
-        ty        = users[client_id].target_y;
+        tx      = users[client_id].target_x;
+        ty      = users[client_id].target_y;
 
         snprintf(hm_local, sizeof(hm_local), "%s", users[client_id].roomcache);
         pthread_mutex_unlock(&users_mutex);
 
         if (should_exit || !users[client_id].used) break;
 
-        /* idle */
         if (!active || room_id == 0) {
             usleep(50000);
             continue;
         }
 
-        /* target changed => recompute full A* path */
+        /* Target changed => recompute full A* path */
         if (seq != last_seq) {
             last_seq = seq;
             path_len = 0;
@@ -3010,29 +3025,24 @@ static void* pathfinding_thread(void* arg) {
             LTHR("A* recalc client=%d from=(%d,%d) to=(%d,%d)", client_id, cx, cy, tx, ty);
 
             path_len = astar_find_path(client_id, room_id, hm_local, cx, cy, tx, ty,
-                                       path, (int)(sizeof(path)/sizeof(path[0])));
+                                       path, (int)(sizeof(path) / sizeof(path[0])));
 
             if (path_len <= 1) {
-                /* no path or already there */
-                if (cx == tx && cy == ty) {
-                    pthread_mutex_lock(&users_mutex);
-                    users[client_id].pathfinding_active = 0;
-                    pthread_mutex_unlock(&users_mutex);
-                } else {
+                pthread_mutex_lock(&users_mutex);
+                users[client_id].pathfinding_active = 0;
+                pthread_mutex_unlock(&users_mutex);
+
+                if (!(cx == tx && cy == ty)) {
                     LTHR("A* no path client=%d at=(%d,%d) target=(%d,%d)", client_id, cx, cy, tx, ty);
-                    pthread_mutex_lock(&users_mutex);
-                    users[client_id].pathfinding_active = 0;
-                    pthread_mutex_unlock(&users_mutex);
                 }
+
                 usleep(50000);
                 continue;
             }
 
-            /* path[0] is current tile, next step is path[1] */
-            path_pos = 1;
+            path_pos = 1; /* path[0] is current tile */
         }
 
-        /* already there (safety) */
         if (cx == tx && cy == ty) {
             pthread_mutex_lock(&users_mutex);
             users[client_id].pathfinding_active = 0;
@@ -3041,43 +3051,35 @@ static void* pathfinding_thread(void* arg) {
             continue;
         }
 
-		if (path_len <= 1 || path_pos >= path_len) {
-			/* path exhausted: stop */
-			pthread_mutex_lock(&users_mutex);
-			users[client_id].pathfinding_active = 0;
-			pthread_mutex_unlock(&users_mutex);
-			usleep(50000);
-			continue;
-		}
+        if (path_len <= 1 || path_pos >= path_len) {
+            pthread_mutex_lock(&users_mutex);
+            users[client_id].pathfinding_active = 0;
+            pthread_mutex_unlock(&users_mutex);
+            usleep(50000);
+            continue;
+        }
 
-        int nx = path[path_pos].x;
-        int ny = path[path_pos].y;
+        const int nx = path[path_pos].x;
+        const int ny = path[path_pos].y;
 
-        /* dynamic check (people move): if blocked now, bump seq to force recalculation */
-        if (!passable_step(client_id, room_id, hm_local, cx, cy, nx, ny)) {
+        /* Dynamic check (people move): if blocked now, bump seq to force recalculation. */
+        if (!is_passable_step(client_id, room_id, hm_local, cx, cy, nx, ny)) {
             LTHR("A* step blocked client=%d next=(%d,%d) forcing recalc", client_id, nx, ny);
             pthread_mutex_lock(&users_mutex);
             users[client_id].pathfinding_seq++;
             pthread_mutex_unlock(&users_mutex);
             usleep(50000);
             continue;
-		}
+        }
 
-int next_z = hm_height_at(hm_local, nx, ny);
-        /*int next_z = hm_height_at(hm_local, nx, ny);
-        if (next_z < 0) {
-            pthread_mutex_lock(&users_mutex);
-            users[client_id].pathfinding_seq++;
-            pthread_mutex_unlock(&users_mutex);
-            usleep(50000);
-            continue;
-        }*/
 
-        int rx = 2, ry = 2;
-        calc_rxry_from_step(nx - cx, ny - cy, &rx, &ry);
+        const int next_z = hm_height_at(hm_local, nx, ny);
+        const int rot = step_dir_to_rot(nx - cx, ny - cy);
+        const int rx = rot;
+        const int ry = rot;
 
         char own_data[64];
-        build_own_data(client_id, own_data, sizeof(own_data));
+        build_user_status_flags(client_id, own_data, sizeof(own_data));
 
         /* broadcast mv status */
         {
@@ -3111,16 +3113,14 @@ int next_z = hm_height_at(hm_local, nx, ny);
 
         path_pos++;
 
-		/* if reached target, stop AND send final non-mv STATUS */
+        /* If reached target, stop AND queue final non-mv STATUS for next tick */
         if (nx == tx && ny == ty) {
             pthread_mutex_lock(&users_mutex);
             users[client_id].pathfinding_active = 0;
             pthread_mutex_unlock(&users_mutex);
 
-            /* queue final stand status for NEXT tick */
-            on_stopped_walking(client_id, room_id, nx, ny, next_z, rx, ry, dancing);
+            queue_final_stand_status_next_tick(client_id, room_id, nx, ny, next_z, rx, ry, dancing);
         }
-
 
         usleep(500000); /* step rate */
     }
