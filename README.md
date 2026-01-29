@@ -8,7 +8,7 @@ The project focuses on portability, simplicity, and adherence to early Habbo net
 This repository provides a low-level C implementation of a classic Habbo Hotel server.  
 By using ANSI C, the codebase avoids platform-specific dependencies and can be compiled with most standard C toolchains.
 
-# Screenshots
+## Screenshots
 
 <img width="1506" height="1228" alt="image" src="https://github.com/user-attachments/assets/a9ab0d8f-4ccc-43c4-94c5-d4e841f8f029" />
 
